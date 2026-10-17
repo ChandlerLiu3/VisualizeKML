@@ -4,6 +4,7 @@ use rfd::{FileDialog, MessageDialog, MessageLevel};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
+use visualize_kml::analysis::analyze_document;
 use visualize_kml::geometry::project_document;
 use visualize_kml::parse_kml;
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
@@ -34,7 +35,7 @@ impl ViewerApp {
 
     fn initialize(&mut self, event_loop: &winit::event_loop::EventLoopWindowTarget<()>) {
         let window = match WindowBuilder::new()
-            .with_title("VisualizeKML - Ctrl+O to open a KML file")
+            .with_title("VisualizeKML 0.2.0 - Ctrl+O to open a KML file")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
             .build(event_loop)
         {
@@ -65,12 +66,13 @@ impl ViewerApp {
             let xml = std::fs::read_to_string(&path)?;
             let document = parse_kml(&xml)?;
             let projected = project_document(&document)?;
+            let analysis = analyze_document(&document);
             let renderer = self
                 .renderer
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("graphics renderer is not ready"))?;
             renderer
-                .set_tracks(projected)
+                .set_tracks(projected, analysis)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             Ok::<_, Box<dyn Error>>(document)
         })();
@@ -87,7 +89,7 @@ impl ViewerApp {
                         document.name
                     };
                     window.set_title(&format!(
-                        "VisualizeKML - {title} (Ctrl+O to open another file)"
+                        "VisualizeKML 0.2.0 - {title} (Ctrl+O to open another file)"
                     ));
                     window.request_redraw();
                 }

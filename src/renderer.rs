@@ -1,11 +1,13 @@
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+use visualize_kml::analysis::{AnalysisResult, AnalyzedMarker, MarkerKind, MarkerSource};
 use visualize_kml::camera::OrbitCamera;
 use visualize_kml::geometry::ProjectedTracks;
+use visualize_kml::{TrackMarker, TrackPoint};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -19,6 +21,15 @@ struct TrajectoryVertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+}
+
+struct SceneMarker {
+    position: [f32; 3],
+    kind: MarkerKind,
+    source: MarkerSource,
+    name: String,
+    point: TrackPoint,
+    kml_metadata: Option<TrackMarker>,
 }
 
 #[derive(Debug)]
@@ -45,6 +56,11 @@ pub struct Renderer {
     uniform_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     window: Arc<Window>,
+    egui_context: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+    markers: Vec<SceneMarker>,
+    warnings: Vec<String>,
+    system_warnings: Vec<String>,
 }
 
 impl Renderer {
@@ -199,6 +215,9 @@ impl Renderer {
             cache: None,
         });
 
+        let egui_context = egui::Context::default();
+        let has_cjk_font = load_cjk_font(&egui_context);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("trajectory vertex buffer"),
             contents: bytemuck::bytes_of(&TrajectoryVertex { position: [0.0; 3] }),
@@ -219,10 +238,38 @@ impl Renderer {
             uniform_bind_group,
             depth_view,
             window,
+            egui_context,
+            egui_renderer,
+            markers: Vec::new(),
+            system_warnings: if has_cjk_font {
+                Vec::new()
+            } else {
+                vec![
+                    "No system CJK font was found; Chinese marker labels may not display"
+                        .to_owned(),
+                ]
+            },
+            warnings: if has_cjk_font {
+                Vec::new()
+            } else {
+                vec![
+                    "No system CJK font was found; Chinese marker labels may not display"
+                        .to_owned(),
+                ]
+            },
         })
     }
 
-    pub fn set_tracks(&mut self, tracks: ProjectedTracks) -> Result<(), RendererError> {
+    pub fn set_tracks(
+        &mut self,
+        tracks: ProjectedTracks,
+        analysis: AnalysisResult,
+    ) -> Result<(), RendererError> {
+        let scene_markers: Vec<SceneMarker> = analysis
+            .markers
+            .into_iter()
+            .map(|marker| scene_marker(&tracks, marker))
+            .collect();
         let mut vertices = Vec::new();
         let mut ranges = Vec::new();
         for segment in tracks.segments {
@@ -254,6 +301,9 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
         self.segment_ranges = ranges;
+        self.markers = scene_markers;
+        self.warnings.clone_from(&self.system_warnings);
+        self.warnings.extend(analysis.warnings);
         self.camera.target = Vec3::ZERO;
         self.camera.distance = 3.2;
         self.window.request_redraw();
@@ -333,7 +383,80 @@ impl Renderer {
                 }
             }
         }
-        self.queue.submit(Some(encoder.finish()));
+
+        let pixels_per_point = self.window.scale_factor() as f32;
+        let screen_rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(
+                self.config.width as f32 / pixels_per_point,
+                self.config.height as f32 / pixels_per_point,
+            ),
+        );
+        let view_projection = self
+            .camera
+            .view_projection(self.config.width as f32 / self.config.height as f32);
+        let markers = &self.markers;
+        let warnings = &self.warnings;
+        let width = self.config.width;
+        let height = self.config.height;
+        let full_output = self.egui_context.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                ..Default::default()
+            },
+            |context| {
+                paint_scene_markers(
+                    context,
+                    markers,
+                    warnings,
+                    view_projection,
+                    width,
+                    height,
+                    pixels_per_point,
+                );
+            },
+        );
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point,
+        };
+        let paint_jobs = self
+            .egui_context
+            .tessellate(full_output.shapes, pixels_per_point);
+        let egui_command_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("trajectory marker overlay pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            self.egui_renderer
+                .render(&mut pass.forget_lifetime(), &paint_jobs, &screen_descriptor);
+        }
+        self.queue
+            .submit(std::iter::once(encoder.finish()).chain(egui_command_buffers));
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
         frame.present();
         Ok(())
     }
@@ -359,4 +482,279 @@ fn create_depth_view(
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn scene_marker(tracks: &ProjectedTracks, marker: AnalyzedMarker) -> SceneMarker {
+    let position = tracks.project_point(&marker.point);
+    SceneMarker {
+        position,
+        kind: marker.kind,
+        source: marker.source,
+        name: marker.name,
+        point: marker.point,
+        kml_metadata: marker.kml_metadata,
+    }
+}
+
+fn paint_scene_markers(
+    context: &egui::Context,
+    markers: &[SceneMarker],
+    warnings: &[String],
+    view_projection: glam::Mat4,
+    width: u32,
+    height: u32,
+    pixels_per_point: f32,
+) {
+    let painter = context.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("scene-markers"),
+    ));
+    let logical_width = width as f32 / pixels_per_point;
+    let logical_height = height as f32 / pixels_per_point;
+    for (index, marker) in markers.iter().enumerate() {
+        let clip = view_projection
+            * Vec4::new(
+                marker.position[0],
+                marker.position[1],
+                marker.position[2],
+                1.0,
+            );
+        if clip.w <= 0.0 {
+            continue;
+        }
+        let ndc = clip.truncate() / clip.w;
+        if !(-1.0..=1.0).contains(&ndc.x)
+            || !(-1.0..=1.0).contains(&ndc.y)
+            || !(0.0..=1.0).contains(&ndc.z)
+        {
+            continue;
+        }
+        let center = egui::pos2(
+            (ndc.x + 1.0) * 0.5 * logical_width,
+            (1.0 - ndc.y) * 0.5 * logical_height,
+        );
+        let color = marker_color(marker.kind);
+        paint_marker_shape(&painter, center, marker.kind, color);
+
+        let mut label = if marker.name.is_empty() {
+            marker.kind.label().to_owned()
+        } else if marker.name == marker.kind.label() {
+            marker.name.clone()
+        } else {
+            format!("{} · {}", marker.kind.label(), marker.name)
+        };
+        if marker.point.has_altitude {
+            label.push_str(&format!("  {:.0} m", marker.point.alt));
+        }
+        painter.text(
+            center + egui::vec2(9.0, -14.0 - (index % 3) as f32 * 12.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    egui::Window::new("轨迹标记")
+        .id(egui::Id::new("track-marker-list"))
+        .default_pos(egui::pos2(12.0, 12.0))
+        .resizable(false)
+        .movable(false)
+        .collapsible(false)
+        .title_bar(false)
+        .default_width(285.0)
+        .show(context, |ui| {
+            ui.label(format!("标记总数：{}", markers.len()));
+            ui.separator();
+            for marker in markers.iter().take(14) {
+                let mut name = if marker.name.is_empty() {
+                    marker.kind.label().to_owned()
+                } else {
+                    marker.name.clone()
+                };
+                if marker.point.has_altitude {
+                    name.push_str(&format!(" · {:.0} m", marker.point.alt));
+                }
+                let response = ui.colored_label(marker_color(marker.kind), name);
+                if let Some(metadata) = &marker.kml_metadata {
+                    let mut tooltip = String::new();
+                    if let Some(id) = &metadata.id {
+                        tooltip.push_str(&format!("ID: {id}\n"));
+                    }
+                    if let Some(style_url) = &metadata.style_url {
+                        tooltip.push_str(&format!("Style: {style_url}\n"));
+                    }
+                    if !metadata.description.is_empty() {
+                        let description: String = metadata.description.chars().take(500).collect();
+                        tooltip.push_str(&description);
+                        if metadata.description.chars().count() > 500 {
+                            tooltip.push('…');
+                        }
+                    }
+                    if !tooltip.is_empty() {
+                        response.on_hover_text(tooltip);
+                    }
+                }
+                let source = match marker.source {
+                    MarkerSource::Kml => "KML 标注",
+                    MarkerSource::TrackEndpoint => "轨迹端点推断",
+                    MarkerSource::ElevationProfile => "轨迹剖面推断",
+                };
+                ui.small(format!("{} · {}", marker.kind.label(), source));
+            }
+            if markers.len() > 14 {
+                ui.small(format!("其余 {} 个标记显示在场景中", markers.len() - 14));
+            }
+            for warning in warnings {
+                ui.colored_label(egui::Color32::YELLOW, warning);
+            }
+        });
+}
+
+fn marker_color(kind: MarkerKind) -> egui::Color32 {
+    match kind {
+        MarkerKind::Start => egui::Color32::from_rgb(80, 220, 125),
+        MarkerKind::End => egui::Color32::from_rgb(250, 90, 90),
+        MarkerKind::Highest | MarkerKind::Peak | MarkerKind::PeakCandidate => {
+            egui::Color32::from_rgb(255, 190, 65)
+        }
+        MarkerKind::Pass | MarkerKind::PassCandidate => egui::Color32::from_rgb(195, 130, 255),
+        MarkerKind::Valley | MarkerKind::ValleyCandidate => egui::Color32::from_rgb(90, 180, 255),
+        MarkerKind::Other => egui::Color32::LIGHT_GRAY,
+    }
+}
+
+fn paint_marker_shape(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    kind: MarkerKind,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+    match kind {
+        MarkerKind::Start | MarkerKind::End => {
+            painter.circle_filled(center, 6.0, color);
+            painter.circle_stroke(center, 6.0, stroke);
+        }
+        MarkerKind::Highest | MarkerKind::Peak | MarkerKind::PeakCandidate => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(0.0, -8.0),
+                    center + egui::vec2(7.0, 6.0),
+                    center + egui::vec2(-7.0, 6.0),
+                ],
+                color,
+                stroke,
+            ));
+        }
+        MarkerKind::Pass | MarkerKind::PassCandidate => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(0.0, -8.0),
+                    center + egui::vec2(8.0, 0.0),
+                    center + egui::vec2(0.0, 8.0),
+                    center + egui::vec2(-8.0, 0.0),
+                ],
+                color,
+                stroke,
+            ));
+        }
+        MarkerKind::Valley | MarkerKind::ValleyCandidate => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    center + egui::vec2(-7.0, -6.0),
+                    center + egui::vec2(7.0, -6.0),
+                    center + egui::vec2(0.0, 8.0),
+                ],
+                color,
+                stroke,
+            ));
+        }
+        MarkerKind::Other => {
+            painter.rect_filled(
+                egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
+                1.0,
+                color,
+            );
+        }
+    }
+}
+
+fn load_cjk_font(context: &egui::Context) -> bool {
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+    ];
+    #[cfg(target_os = "macos")]
+    let candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+    ];
+    #[cfg(target_os = "linux")]
+    let candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ];
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    let candidates: [&str; 0] = [];
+
+    for candidate in candidates {
+        if std::path::Path::new(candidate).exists() {
+            let bytes = match std::fs::read(candidate) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("Could not read CJK font {candidate}: {error}");
+                    return false;
+                }
+            };
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("system-cjk".to_owned(), egui::FontData::from_owned(bytes));
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "system-cjk".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "system-cjk".to_owned());
+            context.set_fonts(fonts);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn system_font_renders_chinese_marker_labels() {
+        let context = egui::Context::default();
+        assert!(load_cjk_font(&context));
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 120.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.label("起点 · 峰顶候选");
+                });
+            },
+        );
+        let meshes = context.tessellate(output.shapes, 1.0);
+        assert!(!meshes.is_empty());
+    }
 }

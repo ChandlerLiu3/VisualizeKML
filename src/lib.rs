@@ -1,8 +1,10 @@
+pub mod analysis;
 pub mod camera;
 pub mod geometry;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -11,6 +13,7 @@ pub struct TrackPoint {
     pub lon: f64,
     pub lat: f64,
     pub alt: f64,
+    pub has_altitude: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -24,12 +27,24 @@ pub struct Track {
     pub segments: Vec<TrackSegment>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackMarker {
+    pub id: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub style_url: Option<String>,
+    pub extended_data: BTreeMap<String, String>,
+    pub point: TrackPoint,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct KmlDocument {
     pub name: String,
     pub sport: String,
     pub distance: f64,
     pub tracks: Vec<Track>,
+    pub markers: Vec<TrackMarker>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,9 +67,24 @@ impl Error for KmlError {}
 #[derive(Debug)]
 enum Capture {
     DocumentName,
+    PlacemarkName,
+    Description,
+    StyleUrl,
     DataValue(String),
     Coordinates,
+    PointCoordinates,
     GxCoordinate,
+}
+
+#[derive(Debug, Default)]
+struct PlacemarkBuilder {
+    id: Option<String>,
+    name: String,
+    description: String,
+    style_url: Option<String>,
+    extended_data: BTreeMap<String, String>,
+    point: Option<TrackPoint>,
+    has_point: bool,
 }
 
 pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
@@ -70,16 +100,42 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
     let mut current_track = Track::default();
     let mut line_segment = TrackSegment::default();
     let mut gx_segment = TrackSegment::default();
+    let mut current_placemark: Option<PlacemarkBuilder> = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 let name = local_name(element.name().as_ref());
+                if name == "Placemark" {
+                    current_placemark = Some(PlacemarkBuilder {
+                        id: element_attribute(&element, b"id")?,
+                        ..PlacemarkBuilder::default()
+                    });
+                } else if name == "Point" {
+                    if let Some(placemark) = &mut current_placemark {
+                        placemark.has_point = true;
+                    }
+                }
                 if name == "Data" || name == "SimpleData" {
                     data_name = name_attribute(&element)?;
+                    if name == "SimpleData" {
+                        if let Some(key) = data_name.clone() {
+                            capture = Some(Capture::DataValue(key));
+                            captured_text.clear();
+                        }
+                    }
                 }
                 if name == "name" && stack.last().is_some_and(|parent| parent == "Document") {
                     capture = Some(Capture::DocumentName);
+                    captured_text.clear();
+                } else if name == "name" && current_placemark.is_some() {
+                    capture = Some(Capture::PlacemarkName);
+                    captured_text.clear();
+                } else if name == "description" && current_placemark.is_some() {
+                    capture = Some(Capture::Description);
+                    captured_text.clear();
+                } else if name == "styleUrl" && current_placemark.is_some() {
+                    capture = Some(Capture::StyleUrl);
                     captured_text.clear();
                 } else if name == "value" {
                     if let Some(key) = data_name.clone() {
@@ -88,6 +144,15 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                     }
                 } else if name == "coordinates" && stack.iter().any(|item| item == "LineString") {
                     capture = Some(Capture::Coordinates);
+                    captured_text.clear();
+                } else if name == "coordinates"
+                    && stack.iter().any(|item| item == "Point")
+                    && current_placemark.is_some()
+                {
+                    if let Some(placemark) = &mut current_placemark {
+                        placemark.has_point = true;
+                    }
+                    capture = Some(Capture::PointCoordinates);
                     captured_text.clear();
                 } else if name == "coord" && stack.iter().any(|item| item == "Track") {
                     capture = Some(Capture::GxCoordinate);
@@ -99,6 +164,10 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                 let name = local_name(element.name().as_ref());
                 if name == "Data" || name == "SimpleData" {
                     data_name = name_attribute(&element)?;
+                } else if name == "Point" {
+                    if let Some(placemark) = &mut current_placemark {
+                        placemark.has_point = true;
+                    }
                 }
             }
             Ok(Event::Text(text)) => {
@@ -130,8 +199,28 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                     Some(Capture::DocumentName) if name == "name" => {
                         document.name = captured_text.trim().to_owned();
                     }
-                    Some(Capture::DataValue(key)) if name == "value" => {
+                    Some(Capture::PlacemarkName) if name == "name" => {
+                        if let Some(placemark) = &mut current_placemark {
+                            placemark.name = captured_text.trim().to_owned();
+                        }
+                    }
+                    Some(Capture::Description) if name == "description" => {
+                        if let Some(placemark) = &mut current_placemark {
+                            placemark.description = captured_text.trim().to_owned();
+                        }
+                    }
+                    Some(Capture::StyleUrl) if name == "styleUrl" => {
+                        if let Some(placemark) = &mut current_placemark {
+                            placemark.style_url = Some(captured_text.trim().to_owned());
+                        }
+                    }
+                    Some(Capture::DataValue(key)) if name == "value" || name == "SimpleData" => {
                         let value = captured_text.trim();
+                        if let Some(placemark) = &mut current_placemark {
+                            placemark
+                                .extended_data
+                                .insert(key.clone(), value.to_owned());
+                        }
                         match key.as_str() {
                             "SportTypeName" => document.sport = value.to_owned(),
                             "Distance" if !value.is_empty() => {
@@ -150,6 +239,14 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                     }
                     Some(Capture::Coordinates) if name == "coordinates" => {
                         append_coordinates(&mut line_segment, &captured_text);
+                    }
+                    Some(Capture::PointCoordinates) if name == "coordinates" => {
+                        if let Some(placemark) = &mut current_placemark {
+                            let points = parse_coordinates(&captured_text);
+                            if let Some(point) = points.into_iter().next() {
+                                placemark.point = Some(point);
+                            }
+                        }
                     }
                     Some(Capture::GxCoordinate) if name == "coord" => {
                         if let Some(point) = parse_gx_coordinate(&captured_text) {
@@ -175,6 +272,25 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                     }
                 } else if name == "Placemark" && !current_track.segments.is_empty() {
                     tracks.push(std::mem::take(&mut current_track));
+                }
+                if name == "Placemark" {
+                    if let Some(placemark) = current_placemark.take() {
+                        if let Some(point) = placemark.point {
+                            document.markers.push(TrackMarker {
+                                id: placemark.id,
+                                name: placemark.name,
+                                description: placemark.description,
+                                style_url: placemark.style_url,
+                                extended_data: placemark.extended_data,
+                                point,
+                            });
+                        } else if placemark.has_point {
+                            document.warnings.push(format!(
+                                "Placemark {:?} has no valid Point coordinate and was skipped",
+                                placemark.name
+                            ));
+                        }
+                    }
                 }
             }
             Ok(Event::Eof) => break,
@@ -239,22 +355,41 @@ fn name_attribute(element: &quick_xml::events::BytesStart<'_>) -> Result<Option<
     Ok(None)
 }
 
-fn append_coordinates(segment: &mut TrackSegment, text: &str) {
-    for coordinate in text.split_whitespace() {
-        if let Some(point) = parse_coordinate_tuple(coordinate, ',') {
-            append_unique(&mut segment.points, point);
+fn element_attribute(
+    element: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<String>, KmlError> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| KmlError::Xml(error.to_string()))?;
+        if attribute.key.local_name().as_ref() == name {
+            let value = attribute
+                .unescape_value()
+                .map_err(|error| KmlError::Xml(error.to_string()))?;
+            return Ok(Some(value.into_owned()));
         }
     }
+    Ok(None)
+}
+
+fn append_coordinates(segment: &mut TrackSegment, text: &str) {
+    for point in parse_coordinates(text) {
+        append_unique(&mut segment.points, point);
+    }
+}
+
+fn parse_coordinates(text: &str) -> Vec<TrackPoint> {
+    text.split_whitespace()
+        .filter_map(|coordinate| parse_coordinate_tuple(coordinate, ','))
+        .collect()
 }
 
 fn parse_coordinate_tuple(text: &str, separator: char) -> Option<TrackPoint> {
     let mut values = text.trim().split(separator);
     let lon = values.next()?.trim().parse::<f64>().ok()?;
     let lat = values.next()?.trim().parse::<f64>().ok()?;
-    let alt = match values.next() {
-        Some(value) if !value.trim().is_empty() => value.trim().parse::<f64>().ok()?,
-        None => 0.0,
-        Some(_) => 0.0,
+    let (alt, has_altitude) = match values.next() {
+        Some(value) if !value.trim().is_empty() => (value.trim().parse::<f64>().ok()?, true),
+        None | Some(_) => (0.0, false),
     };
     if values.next().is_some()
         || !lon.is_finite()
@@ -265,17 +400,21 @@ fn parse_coordinate_tuple(text: &str, separator: char) -> Option<TrackPoint> {
     {
         return None;
     }
-    Some(TrackPoint { lon, lat, alt })
+    Some(TrackPoint {
+        lon,
+        lat,
+        alt,
+        has_altitude,
+    })
 }
 
 fn parse_gx_coordinate(text: &str) -> Option<TrackPoint> {
     let mut values = text.split_whitespace();
     let lon = values.next()?.parse::<f64>().ok()?;
     let lat = values.next()?.parse::<f64>().ok()?;
-    let alt = match values.next() {
-        Some(value) if !value.trim().is_empty() => value.parse::<f64>().ok()?,
-        None => 0.0,
-        Some(_) => 0.0,
+    let (alt, has_altitude) = match values.next() {
+        Some(value) if !value.trim().is_empty() => (value.parse::<f64>().ok()?, true),
+        None | Some(_) => (0.0, false),
     };
     if values.next().is_some()
         || !lon.is_finite()
@@ -286,7 +425,12 @@ fn parse_gx_coordinate(text: &str) -> Option<TrackPoint> {
     {
         return None;
     }
-    Some(TrackPoint { lon, lat, alt })
+    Some(TrackPoint {
+        lon,
+        lat,
+        alt,
+        has_altitude,
+    })
 }
 
 fn append_unique(points: &mut Vec<TrackPoint>, point: TrackPoint) {

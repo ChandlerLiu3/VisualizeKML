@@ -9,6 +9,37 @@ pub struct ProjectedTracks {
     pub segments: Vec<Vec<[f32; 3]>>,
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
+    projection: LocalProjection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct LocalProjection {
+    origin_lon: f64,
+    origin_lat: f64,
+    origin_alt: f64,
+    origin_lat_radians: f64,
+    center: [f64; 3],
+    scale: f64,
+}
+
+impl ProjectedTracks {
+    pub fn project_point(&self, point: &TrackPoint) -> [f32; 3] {
+        let delta_lon = (point.lon - self.projection.origin_lon + 180.0).rem_euclid(360.0) - 180.0;
+        let local = [
+            EARTH_RADIUS_METERS * delta_lon.to_radians() * self.projection.origin_lat_radians.cos(),
+            if point.has_altitude {
+                point.alt - self.projection.origin_alt
+            } else {
+                0.0
+            },
+            EARTH_RADIUS_METERS * (point.lat - self.projection.origin_lat).to_radians(),
+        ];
+        [
+            ((local[0] - self.projection.center[0]) * self.projection.scale) as f32,
+            ((local[1] - self.projection.center[1]) * self.projection.scale) as f32,
+            ((local[2] - self.projection.center[2]) * self.projection.scale) as f32,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +194,14 @@ pub fn project_segments(segments: &[&TrackSegment]) -> Result<ProjectedTracks, G
             ((max[1] - center[1]) * scale) as f32,
             ((max[2] - center[2]) * scale) as f32,
         ],
+        projection: LocalProjection {
+            origin_lon,
+            origin_lat,
+            origin_alt,
+            origin_lat_radians,
+            center,
+            scale,
+        },
     })
 }
 
@@ -178,11 +217,13 @@ mod tests {
                     lon: 0.0,
                     lat: 0.0,
                     alt: 100.0,
+                    has_altitude: true,
                 },
                 TrackPoint {
                     lon: 0.001,
                     lat: 0.001,
                     alt: 110.0,
+                    has_altitude: true,
                 },
             ],
         }];
@@ -205,16 +246,19 @@ mod tests {
                     lon: 0.0,
                     lat: 0.0,
                     alt: 0.0,
+                    has_altitude: true,
                 },
                 TrackPoint {
                     lon: 0.001,
                     lat: 0.0,
                     alt: 0.0,
+                    has_altitude: true,
                 },
                 TrackPoint {
                     lon: 0.0,
                     lat: 0.001,
                     alt: 0.0,
+                    has_altitude: true,
                 },
             ],
         };
@@ -225,5 +269,29 @@ mod tests {
         assert!((points[1][2] - points[0][2]).abs() < 1e-6);
         assert!(points[2][2] > points[0][2]);
         assert!((points[2][0] - points[0][0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn marker_coordinates_use_the_same_local_projection_as_track_vertices() {
+        let segment = TrackSegment {
+            points: vec![
+                TrackPoint {
+                    lon: 115.0,
+                    lat: 39.0,
+                    alt: 100.0,
+                    has_altitude: true,
+                },
+                TrackPoint {
+                    lon: 115.01,
+                    lat: 39.01,
+                    alt: 150.0,
+                    has_altitude: true,
+                },
+            ],
+        };
+        let projected = project_segments(&[&segment]).expect("route should project");
+        let marker_position = projected.project_point(&segment.points[0]);
+
+        assert_eq!(marker_position, projected.segments[0][0]);
     }
 }

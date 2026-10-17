@@ -1,10 +1,12 @@
 [package]
 name = "visualize_kml"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 bytemuck = { version = "1.16", features = ["derive"] }
+egui = "0.29"
+egui-wgpu = "0.29"
 glam = "0.28"
 quick-xml = "0.31"
 pollster = "0.3"
