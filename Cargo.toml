@@ -4,4 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bytemuck = { version = "1.16", features = ["derive"] }
+glam = "0.28"
 quick-xml = "0.31"
+pollster = "0.3"
+rfd = "0.15"
+wgpu = "22"
+winit = "0.29"
