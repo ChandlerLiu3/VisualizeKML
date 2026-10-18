@@ -7,7 +7,7 @@ use std::sync::Arc;
 use visualize_kml::analysis::{AnalysisResult, AnalyzedMarker, MarkerKind, MarkerSource};
 use visualize_kml::camera::OrbitCamera;
 use visualize_kml::geometry::ProjectedTracks;
-use visualize_kml::{TrackMarker, TrackPoint};
+use visualize_kml::TrackMarker;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -25,10 +25,10 @@ struct CameraUniform {
 
 struct SceneMarker {
     position: [f32; 3],
+    route_direction: Option<Vec3>,
     kind: MarkerKind,
     source: MarkerSource,
     name: String,
-    point: TrackPoint,
     kml_metadata: Option<TrackMarker>,
 }
 
@@ -486,12 +486,17 @@ fn create_depth_view(
 
 fn scene_marker(tracks: &ProjectedTracks, marker: AnalyzedMarker) -> SceneMarker {
     let position = tracks.project_point(&marker.point);
+    let route_direction = tracks
+        .segments
+        .iter()
+        .find(|segment| segment.len() > 1)
+        .map(|segment| Vec3::from_array(segment[1]) - Vec3::from_array(segment[0]));
     SceneMarker {
         position,
+        route_direction,
         kind: marker.kind,
         source: marker.source,
         name: marker.name,
-        point: marker.point,
         kml_metadata: marker.kml_metadata,
     }
 }
@@ -533,26 +538,29 @@ fn paint_scene_markers(
             (ndc.x + 1.0) * 0.5 * logical_width,
             (1.0 - ndc.y) * 0.5 * logical_height,
         );
+        let route_direction = marker.route_direction.and_then(|direction| {
+            let next_position = Vec3::from_array(marker.position) + direction;
+            let next_clip = view_projection * next_position.extend(1.0);
+            (next_clip.w > 0.0).then(|| {
+                let next_ndc = next_clip.truncate() / next_clip.w;
+                egui::vec2(
+                    (next_ndc.x - ndc.x) * logical_width * 0.5,
+                    (ndc.y - next_ndc.y) * logical_height * 0.5,
+                )
+            })
+        });
         let color = marker_color(marker.kind);
-        paint_marker_shape(&painter, center, marker.kind, color);
+        paint_marker_shape(&painter, center, marker.kind, color, route_direction);
 
-        let mut label = if marker.name.is_empty() {
-            marker.kind.label().to_owned()
-        } else if marker.name == marker.kind.label() {
-            marker.name.clone()
-        } else {
-            format!("{} · {}", marker.kind.label(), marker.name)
-        };
-        if marker.point.has_altitude {
-            label.push_str(&format!("  {:.0} m", marker.point.alt));
+        if let Some(label) = marker_label(&marker.name) {
+            painter.text(
+                center + egui::vec2(9.0, -14.0 - (index % 3) as f32 * 12.0),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(13.0),
+                egui::Color32::WHITE,
+            );
         }
-        painter.text(
-            center + egui::vec2(9.0, -14.0 - (index % 3) as f32 * 12.0),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(13.0),
-            egui::Color32::WHITE,
-        );
     }
 
     egui::Window::new("轨迹标记")
@@ -567,15 +575,10 @@ fn paint_scene_markers(
             ui.label(format!("标记总数：{}", markers.len()));
             ui.separator();
             for marker in markers.iter().take(14) {
-                let mut name = if marker.name.is_empty() {
-                    marker.kind.label().to_owned()
-                } else {
-                    marker.name.clone()
-                };
-                if marker.point.has_altitude {
-                    name.push_str(&format!(" · {:.0} m", marker.point.alt));
-                }
-                let response = ui.colored_label(marker_color(marker.kind), name);
+                let response = ui.colored_label(
+                    marker_color(marker.kind),
+                    marker_label(&marker.name).unwrap_or(marker.kind.label()),
+                );
                 if let Some(metadata) = &marker.kml_metadata {
                     let mut tooltip = String::new();
                     if let Some(id) = &metadata.id {
@@ -618,10 +621,52 @@ fn marker_color(kind: MarkerKind) -> egui::Color32 {
         MarkerKind::Highest | MarkerKind::Peak | MarkerKind::PeakCandidate => {
             egui::Color32::from_rgb(255, 190, 65)
         }
+        MarkerKind::Lowest => egui::Color32::from_rgb(90, 180, 255),
         MarkerKind::Pass | MarkerKind::PassCandidate => egui::Color32::from_rgb(195, 130, 255),
         MarkerKind::Valley | MarkerKind::ValleyCandidate => egui::Color32::from_rgb(90, 180, 255),
         MarkerKind::Other => egui::Color32::LIGHT_GRAY,
     }
+}
+
+fn marker_label(name: &str) -> Option<&str> {
+    let name = name.trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn start_triangle_vertices(center: egui::Pos2, direction: Option<egui::Vec2>) -> [egui::Pos2; 3] {
+    let direction = direction
+        .filter(|direction| direction.is_finite() && direction.length_sq() > 1e-6)
+        .map(egui::Vec2::normalized)
+        .unwrap_or(egui::vec2(0.0, -1.0));
+    let side = egui::vec2(-direction.y, direction.x);
+    [
+        center + direction * 10.0,
+        center - direction * 6.0 + side * 6.0,
+        center - direction * 6.0 - side * 6.0,
+    ]
+}
+
+fn endpoint_flag_cells(
+    center: egui::Pos2,
+    color: egui::Color32,
+) -> [(egui::Rect, egui::Color32); 4] {
+    std::array::from_fn(|index| {
+        let row = index / 2;
+        let column = index % 2;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(
+                center.x - 5.0 + column as f32 * 5.0,
+                center.y - 9.0 + row as f32 * 5.0,
+            ),
+            egui::vec2(5.0, 5.0),
+        );
+        let color = if (row + column) % 2 == 0 {
+            color
+        } else {
+            egui::Color32::WHITE
+        };
+        (rect, color)
+    })
 }
 
 fn paint_marker_shape(
@@ -629,53 +674,41 @@ fn paint_marker_shape(
     center: egui::Pos2,
     kind: MarkerKind,
     color: egui::Color32,
+    route_direction: Option<egui::Vec2>,
 ) {
     let stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
     match kind {
-        MarkerKind::Start | MarkerKind::End => {
-            painter.circle_filled(center, 6.0, color);
-            painter.circle_stroke(center, 6.0, stroke);
-        }
-        MarkerKind::Highest | MarkerKind::Peak | MarkerKind::PeakCandidate => {
+        MarkerKind::Start => {
             painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + egui::vec2(0.0, -8.0),
-                    center + egui::vec2(7.0, 6.0),
-                    center + egui::vec2(-7.0, 6.0),
-                ],
+                start_triangle_vertices(center, route_direction).to_vec(),
                 color,
                 stroke,
             ));
         }
-        MarkerKind::Pass | MarkerKind::PassCandidate => {
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + egui::vec2(0.0, -8.0),
-                    center + egui::vec2(8.0, 0.0),
-                    center + egui::vec2(0.0, 8.0),
-                    center + egui::vec2(-8.0, 0.0),
+        MarkerKind::End => {
+            let pole_x = center.x - 5.0;
+            painter.line_segment(
+                [
+                    egui::pos2(pole_x, center.y + 8.0),
+                    egui::pos2(pole_x, center.y - 9.0),
                 ],
-                color,
-                stroke,
-            ));
-        }
-        MarkerKind::Valley | MarkerKind::ValleyCandidate => {
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + egui::vec2(-7.0, -6.0),
-                    center + egui::vec2(7.0, -6.0),
-                    center + egui::vec2(0.0, 8.0),
-                ],
-                color,
-                stroke,
-            ));
-        }
-        MarkerKind::Other => {
-            painter.rect_filled(
-                egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
-                1.0,
-                color,
+                egui::Stroke::new(2.0_f32, color),
             );
+            for (square, square_color) in endpoint_flag_cells(center, color) {
+                painter.rect_filled(square, 0.0, square_color);
+            }
+        }
+        MarkerKind::Highest
+        | MarkerKind::Lowest
+        | MarkerKind::Peak
+        | MarkerKind::Pass
+        | MarkerKind::Valley
+        | MarkerKind::PeakCandidate
+        | MarkerKind::PassCandidate
+        | MarkerKind::ValleyCandidate
+        | MarkerKind::Other => {
+            painter.circle_filled(center, 4.0, color);
+            painter.circle_stroke(center, 4.0, stroke);
         }
     }
 }
@@ -735,6 +768,37 @@ fn load_cjk_font(context: &egui::Context) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn marker_labels_only_use_non_empty_source_names() {
+        assert_eq!(marker_label("  trail marker  "), Some("trail marker"));
+        assert_eq!(marker_label("   "), None);
+        assert_eq!(marker_label(""), None);
+    }
+
+    #[test]
+    fn start_triangle_follows_route_direction_and_defaults_to_screen_up() {
+        let center = egui::pos2(20.0, 30.0);
+        let north_facing = start_triangle_vertices(center, None);
+        let route_facing = start_triangle_vertices(center, Some(egui::vec2(1.0, 0.0)));
+
+        assert!(north_facing[0].y < center.y);
+        assert!(route_facing[0].x > center.x);
+    }
+
+    #[test]
+    fn endpoint_flag_uses_a_two_by_two_checkerboard() {
+        let color = egui::Color32::from_rgb(250, 90, 90);
+        let cells = endpoint_flag_cells(egui::pos2(20.0, 30.0), color);
+
+        assert_eq!(cells[0].1, color);
+        assert_eq!(cells[1].1, egui::Color32::WHITE);
+        assert_eq!(cells[2].1, egui::Color32::WHITE);
+        assert_eq!(cells[3].1, color);
+        assert!(cells.iter().all(|(rect, _)| {
+            (rect.width() - 5.0).abs() < f32::EPSILON && (rect.height() - 5.0).abs() < f32::EPSILON
+        }));
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn system_font_renders_chinese_marker_labels() {
@@ -750,7 +814,7 @@ mod tests {
             },
             |context| {
                 egui::CentralPanel::default().show(context, |ui| {
-                    ui.label("起点 · 峰顶候选");
+                    ui.label("起点 · 最低点");
                 });
             },
         );

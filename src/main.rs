@@ -2,6 +2,7 @@ mod renderer;
 
 use rfd::{FileDialog, MessageDialog, MessageLevel};
 use std::error::Error;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use visualize_kml::analysis::analyze_document;
@@ -11,6 +12,8 @@ use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEve
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowBuilder};
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct ViewerApp {
     window: Option<Arc<Window>>,
@@ -35,7 +38,9 @@ impl ViewerApp {
 
     fn initialize(&mut self, event_loop: &winit::event_loop::EventLoopWindowTarget<()>) {
         let window = match WindowBuilder::new()
-            .with_title("VisualizeKML 0.2.0 - Ctrl+O to open a KML file")
+            .with_title(format!(
+                "VisualizeKML {APP_VERSION} - Ctrl+O to open a KML file"
+            ))
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0))
             .build(event_loop)
         {
@@ -89,7 +94,7 @@ impl ViewerApp {
                         document.name
                     };
                     window.set_title(&format!(
-                        "VisualizeKML 0.2.0 - {title} (Ctrl+O to open another file)"
+                        "VisualizeKML {APP_VERSION} - {title} (Ctrl+O to open another file)"
                     ));
                     window.request_redraw();
                 }
@@ -216,7 +221,13 @@ fn show_error(title: &str, description: &str) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let initial_path = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
+    let mut args = std::env::args_os().skip(1);
+    let first_arg = args.next();
+    if first_arg.as_deref() == Some(OsStr::new("--version")) {
+        println!("VisualizeKML {APP_VERSION}");
+        return Ok(());
+    }
+    let initial_path = first_arg.map(PathBuf::from).or_else(|| {
         FileDialog::new()
             .add_filter("KML files", &["kml"])
             .pick_file()

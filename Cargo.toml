@@ -1,7 +1,8 @@
 [package]
 name = "visualize_kml"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 bytemuck = { version = "1.16", features = ["derive"] }

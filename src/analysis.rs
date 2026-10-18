@@ -4,12 +4,14 @@ pub const MIN_TERRAIN_PROMINENCE_METERS: f64 = 30.0;
 pub const MIN_TERRAIN_MARKER_DISTANCE_METERS: f64 = 500.0;
 const DUPLICATE_MARKER_DISTANCE_METERS: f64 = 5.0;
 const EXPLICIT_MATCH_DISTANCE_METERS: f64 = 20.0;
+const LOCAL_PEAK_VALIDATION_PASSED: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkerKind {
     Start,
     End,
     Highest,
+    Lowest,
     Peak,
     Pass,
     Valley,
@@ -25,6 +27,7 @@ impl MarkerKind {
             Self::Start => "起点",
             Self::End => "终点",
             Self::Highest => "最高点",
+            Self::Lowest => "最低点",
             Self::Peak => "峰顶",
             Self::Pass => "垭口",
             Self::Valley => "谷底",
@@ -130,8 +133,25 @@ pub fn analyze_document(document: &KmlDocument) -> AnalysisResult {
             AnalyzedMarker {
                 kind: MarkerKind::Highest,
                 source: MarkerSource::ElevationProfile,
-                name: MarkerKind::Highest.label().to_owned(),
+                name: String::new(),
                 point: highest.clone(),
+                kml_metadata: None,
+            },
+            DUPLICATE_MARKER_DISTANCE_METERS,
+        );
+
+        let lowest = altitude_points
+            .iter()
+            .copied()
+            .reduce(|best, point| if point.alt < best.alt { point } else { best })
+            .expect("altitude points are non-empty when the highest point exists");
+        push_unique(
+            &mut result.markers,
+            AnalyzedMarker {
+                kind: MarkerKind::Lowest,
+                source: MarkerSource::ElevationProfile,
+                name: String::new(),
+                point: lowest.clone(),
                 kml_metadata: None,
             },
             DUPLICATE_MARKER_DISTANCE_METERS,
@@ -142,9 +162,11 @@ pub fn analyze_document(document: &KmlDocument) -> AnalysisResult {
         );
     }
 
-    for segment in &segments {
-        for run in altitude_runs(segment) {
-            add_terrain_candidates(&mut result, run);
+    if LOCAL_PEAK_VALIDATION_PASSED {
+        for segment in &segments {
+            for run in altitude_runs(segment) {
+                add_peak_candidates(&mut result, run);
+            }
         }
     }
 
@@ -162,7 +184,7 @@ fn add_endpoint_if_missing(
             AnalyzedMarker {
                 kind,
                 source: MarkerSource::TrackEndpoint,
-                name: kind.label().to_owned(),
+                name: String::new(),
                 point: point.clone(),
                 kml_metadata: None,
             },
@@ -221,53 +243,26 @@ fn altitude_runs(points: &[TrackPoint]) -> Vec<&[TrackPoint]> {
     runs
 }
 
-fn add_terrain_candidates(result: &mut AnalysisResult, points: &[TrackPoint]) {
+fn add_peak_candidates(result: &mut AnalysisResult, points: &[TrackPoint]) {
     if points.len() < 3 {
         return;
     }
 
     let elevations: Vec<f64> = points.iter().map(|point| point.alt).collect();
     let extrema = local_extrema(&elevations);
-    let peak_indices = prominent_extrema(points, &extrema.peaks, &elevations, true);
-    let valley_indices = prominent_extrema(points, &extrema.valleys, &elevations, false);
-    let mut candidates: Vec<(usize, bool, f64)> = peak_indices
-        .iter()
-        .map(|&index| (index, true, prominence_at(index, &elevations, true)))
-        .chain(
-            valley_indices
-                .iter()
-                .map(|&index| (index, false, prominence_at(index, &elevations, false))),
-        )
-        .collect();
-    candidates.sort_by(|left, right| right.2.total_cmp(&left.2));
-
-    let mut selected = Vec::<(usize, bool)>::new();
-    for (index, is_peak, _) in candidates {
+    let peak_indices = prominent_extrema(points, &extrema.peaks, &elevations);
+    for index in peak_indices {
         let point = &points[index];
-        let between_peaks = !is_peak
-            && peak_indices.iter().any(|peak| *peak < index)
-            && peak_indices.iter().any(|peak| *peak > index);
-        let kind = if is_peak {
-            MarkerKind::PeakCandidate
-        } else if between_peaks {
-            MarkerKind::PassCandidate
-        } else {
-            MarkerKind::ValleyCandidate
-        };
-        if has_explicit_near(result, kind, point)
-            || selected.iter().any(|(other_index, _)| {
-                distance_meters(point, &points[*other_index]) < MIN_TERRAIN_MARKER_DISTANCE_METERS
-            })
-        {
+        let kind = MarkerKind::PeakCandidate;
+        if has_explicit_near(result, kind, point) {
             continue;
         }
-        selected.push((index, is_peak));
         push_unique(
             &mut result.markers,
             AnalyzedMarker {
                 kind,
                 source: MarkerSource::ElevationProfile,
-                name: kind.label().to_owned(),
+                name: String::new(),
                 point: point.clone(),
                 kml_metadata: None,
             },
@@ -279,7 +274,6 @@ fn add_terrain_candidates(result: &mut AnalysisResult, points: &[TrackPoint]) {
 #[derive(Default)]
 struct Extrema {
     peaks: Vec<usize>,
-    valleys: Vec<usize>,
 }
 
 fn local_extrema(elevations: &[f64]) -> Extrema {
@@ -298,8 +292,6 @@ fn local_extrema(elevations: &[f64]) -> Extrema {
             let representative = start + (end - start) / 2;
             if value > before && value > after {
                 extrema.peaks.push(representative);
-            } else if value < before && value < after {
-                extrema.valleys.push(representative);
             }
         }
         start = end + 1;
@@ -312,13 +304,12 @@ fn prominent_extrema(
     points: &[TrackPoint],
     candidates: &[usize],
     elevations: &[f64],
-    is_peak: bool,
 ) -> Vec<usize> {
     let mut ranked: Vec<(usize, f64)> = candidates
         .iter()
         .copied()
         .filter_map(|index| {
-            let prominence = prominence_at(index, elevations, is_peak);
+            let prominence = prominence_at(index, elevations);
             (prominence >= MIN_TERRAIN_PROMINENCE_METERS).then_some((index, prominence))
         })
         .collect();
@@ -337,16 +328,11 @@ fn prominent_extrema(
     selected
 }
 
-fn prominence_at(index: usize, elevations: &[f64], is_peak: bool) -> f64 {
+fn prominence_at(index: usize, elevations: &[f64]) -> f64 {
     let left = &elevations[..index];
     let right = &elevations[index + 1..];
-    if is_peak {
-        (elevations[index] - left.iter().copied().fold(f64::INFINITY, f64::min))
-            .min(elevations[index] - right.iter().copied().fold(f64::INFINITY, f64::min))
-    } else {
-        (left.iter().copied().fold(f64::NEG_INFINITY, f64::max) - elevations[index])
-            .min(right.iter().copied().fold(f64::NEG_INFINITY, f64::max) - elevations[index])
-    }
+    (elevations[index] - left.iter().copied().fold(f64::INFINITY, f64::min))
+        .min(elevations[index] - right.iter().copied().fold(f64::INFINITY, f64::min))
 }
 
 fn has_explicit_near(

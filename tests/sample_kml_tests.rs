@@ -1,4 +1,5 @@
-use visualize_kml::{parse_track_metadata, parse_track_points_from_kml};
+use visualize_kml::geometry::project_document;
+use visualize_kml::{parse_kml, parse_track_metadata, parse_track_points_from_kml};
 
 #[test]
 fn sample_kml_can_be_parsed_into_points() {
@@ -43,5 +44,32 @@ fn sample_kml_metadata_is_extracted() {
     assert!(
         (distance - 9110.99625616947).abs() < 1e-6,
         "distance should match sample metadata"
+    );
+}
+
+#[test]
+fn sample_route_preserves_east_west_direction_after_projection() {
+    let document = parse_kml(include_str!("../sample.kml")).expect("sample KML should parse");
+    let projected = project_document(&document).expect("sample route should project");
+    let points: Vec<_> = document
+        .tracks
+        .iter()
+        .flat_map(|track| &track.segments)
+        .flat_map(|segment| &segment.points)
+        .collect();
+    let westernmost = points
+        .iter()
+        .copied()
+        .min_by(|left, right| left.lon.total_cmp(&right.lon))
+        .expect("sample should have route points");
+    let easternmost = points
+        .iter()
+        .copied()
+        .max_by(|left, right| left.lon.total_cmp(&right.lon))
+        .expect("sample should have route points");
+
+    assert!(
+        projected.project_point(easternmost)[0] > projected.project_point(westernmost)[0],
+        "the sample's easternmost route point must have a greater +X coordinate"
     );
 }

@@ -255,6 +255,12 @@ mod tests {
                     has_altitude: true,
                 },
                 TrackPoint {
+                    lon: -0.001,
+                    lat: 0.0,
+                    alt: 0.0,
+                    has_altitude: true,
+                },
+                TrackPoint {
                     lon: 0.0,
                     lat: 0.001,
                     alt: 0.0,
@@ -267,8 +273,61 @@ mod tests {
 
         assert!(points[1][0] > points[0][0]);
         assert!((points[1][2] - points[0][2]).abs() < 1e-6);
-        assert!(points[2][2] > points[0][2]);
-        assert!((points[2][0] - points[0][0]).abs() < 1e-6);
+        assert!(points[2][0] < points[0][0]);
+        assert!((points[2][2] - points[0][2]).abs() < 1e-6);
+        assert!(points[3][2] > points[0][2]);
+        assert!((points[3][0] - points[0][0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn latitude_direction_and_altitude_axis_are_independent() {
+        let segment = TrackSegment {
+            points: vec![
+                TrackPoint {
+                    lon: 0.0,
+                    lat: 0.0,
+                    alt: 100.0,
+                    has_altitude: true,
+                },
+                TrackPoint {
+                    lon: 0.0,
+                    lat: 0.001,
+                    alt: 100.0,
+                    has_altitude: true,
+                },
+                TrackPoint {
+                    lon: 0.0,
+                    lat: -0.001,
+                    alt: 100.0,
+                    has_altitude: true,
+                },
+                TrackPoint {
+                    lon: 0.0,
+                    lat: 0.0,
+                    alt: 200.0,
+                    has_altitude: true,
+                },
+            ],
+        };
+        let projected = project_segments(&[&segment]).expect("valid route should project");
+        let [origin, north, south, higher] = projected.segments[0].as_slice() else {
+            panic!("expected four projected points");
+        };
+
+        assert!(
+            north[2] > origin[2],
+            "increasing latitude must move north (+Z)"
+        );
+        assert!(
+            south[2] < origin[2],
+            "decreasing latitude must move south (-Z)"
+        );
+        assert!((higher[0] - origin[0]).abs() < 1e-6);
+        assert!((higher[2] - origin[2]).abs() < 1e-6);
+        assert!(
+            higher[1] > origin[1],
+            "altitude must use the vertical (+Y) axis"
+        );
     }
 
     #[test]

@@ -96,7 +96,7 @@ fn prefers_explicit_start_and_end_and_infers_highest_from_track() {
 }
 
 #[test]
-fn infers_start_end_and_filters_noise_while_finding_terrain_candidates() {
+fn infers_start_end_without_unvalidated_terrain_candidates() {
     let xml = r#"
         <kml><Placemark><LineString><coordinates>
           10,20,0 10.01,20,100 10.02,20,0 10.03,20,80 10.04,20,-50 10.05,20,0
@@ -123,17 +123,13 @@ fn infers_start_end_and_filters_noise_while_finding_terrain_candidates() {
             .source,
         MarkerSource::TrackEndpoint
     );
-    assert!(markers.markers.iter().any(|marker| {
-        marker.kind == MarkerKind::PeakCandidate && marker.source == MarkerSource::ElevationProfile
-    }));
-    assert!(markers
-        .markers
-        .iter()
-        .any(|marker| marker.kind == MarkerKind::PassCandidate));
-    assert!(markers
-        .markers
-        .iter()
-        .any(|marker| marker.kind == MarkerKind::ValleyCandidate));
+    assert!(
+        !markers.markers.iter().any(|marker| matches!(
+            marker.kind,
+            MarkerKind::PeakCandidate | MarkerKind::PassCandidate | MarkerKind::ValleyCandidate
+        )),
+        "local terrain candidates must remain disabled without validation data"
+    );
 
     let noisy_xml = r#"
         <kml><Placemark><LineString><coordinates>
@@ -162,11 +158,64 @@ fn infers_start_end_and_filters_noise_while_finding_terrain_candidates() {
             )
         })
         .collect();
-    assert_eq!(
-        terrain_candidates.len(),
-        1,
-        "nearby peaks and troughs should share one minimum-spacing filter"
+    assert!(
+        terrain_candidates.is_empty(),
+        "terrain candidates must not be emitted before real-track validation"
     );
+}
+
+#[test]
+fn unnamed_explicit_markers_do_not_receive_generated_names() {
+    let xml = r#"
+        <kml><Document>
+          <Placemark id="start-marker"><Point><coordinates>10,20,10</coordinates></Point></Placemark>
+          <Placemark><LineString><coordinates>10,20,10 10.01,20,80</coordinates></LineString></Placemark>
+        </Document></kml>
+    "#;
+    let markers = analyze_document(&parse_kml(xml).expect("valid track should parse"));
+
+    assert!(markers
+        .markers
+        .iter()
+        .filter(|marker| matches!(marker.kind, MarkerKind::Start | MarkerKind::End))
+        .all(|marker| marker.name.is_empty()));
+    assert!(markers
+        .markers
+        .iter()
+        .filter(|marker| matches!(marker.kind, MarkerKind::Highest | MarkerKind::Lowest))
+        .all(|marker| marker.name.is_empty()));
+}
+
+#[test]
+fn emits_global_highest_and_lowest_without_synthesized_names_or_local_candidates() {
+    let xml = r#"
+        <kml><Placemark><LineString><coordinates>
+          10,20,10 10.001,20,120 10.002,20,30 10.003,20,-40 10.004,20,20
+        </coordinates></LineString></Placemark></kml>
+    "#;
+    let markers = analyze_document(&parse_kml(xml).expect("valid track should parse"));
+
+    let highest = markers
+        .markers
+        .iter()
+        .find(|marker| marker.kind == MarkerKind::Highest)
+        .expect("global highest point should be marked");
+    let lowest = markers
+        .markers
+        .iter()
+        .find(|marker| marker.kind == MarkerKind::Lowest)
+        .expect("global lowest point should be marked");
+    assert_eq!(highest.point.alt, 120.0);
+    assert_eq!(lowest.point.alt, -40.0);
+    assert!(highest.name.is_empty());
+    assert!(lowest.name.is_empty());
+    assert!(markers.markers.iter().all(|marker| !matches!(
+        marker.kind,
+        MarkerKind::PeakCandidate | MarkerKind::PassCandidate | MarkerKind::ValleyCandidate
+    )));
+    assert!(markers.markers.iter().all(|marker| {
+        !matches!(marker.kind, MarkerKind::Start | MarkerKind::End) || marker.name.is_empty()
+    }));
 }
 
 #[test]
@@ -192,6 +241,7 @@ fn missing_altitude_suppresses_elevation_markers_and_duplicate_points_are_dedupl
     assert!(!markers.markers.iter().any(|marker| matches!(
         marker.kind,
         MarkerKind::Highest
+            | MarkerKind::Lowest
             | MarkerKind::PeakCandidate
             | MarkerKind::PassCandidate
             | MarkerKind::ValleyCandidate
@@ -253,7 +303,7 @@ fn identifies_semantic_markers_from_extended_data_and_style_reference() {
 }
 
 #[test]
-fn sample_kml_provides_explicit_endpoints_and_terrain_candidates() {
+fn sample_kml_provides_explicit_endpoints_without_unvalidated_local_candidates() {
     let document = parse_kml(include_str!("../sample.kml")).expect("sample KML should parse");
     let analysis = analyze_document(&document);
     let start = analysis
@@ -287,7 +337,7 @@ fn sample_kml_provides_explicit_endpoints_and_terrain_candidates() {
             .alt,
         highest_track_altitude
     );
-    assert!(analysis.markers.iter().any(|marker| matches!(
+    assert!(!analysis.markers.iter().any(|marker| matches!(
         marker.kind,
         MarkerKind::PeakCandidate | MarkerKind::PassCandidate | MarkerKind::ValleyCandidate
     )));
