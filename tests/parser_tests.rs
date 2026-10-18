@@ -1,4 +1,4 @@
-use visualize_kml::{parse_kml, KmlError};
+use visualize_kml::{parse_kml, AltitudeReference, KmlError};
 
 #[test]
 fn parses_sample_gx_track_and_metadata() {
@@ -64,4 +64,66 @@ fn reports_malformed_xml() {
 fn reports_invalid_numeric_metadata() {
     let xml = r#"<kml><Document><ExtendedData><Data name="Distance"><value>unknown</value></Data></ExtendedData><Placemark><LineString><coordinates>0,0 1,1</coordinates></LineString></Placemark></Document></kml>"#;
     assert!(matches!(parse_kml(xml), Err(KmlError::Xml(_))));
+}
+
+#[test]
+fn preserves_altitude_reference_for_tracks_and_point_markers() {
+    let xml = r#"
+        <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
+          <Placemark>
+            <LineString>
+              <altitudeMode>absolute</altitudeMode>
+              <coordinates>0,0,10 0.001,0,20</coordinates>
+            </LineString>
+          </Placemark>
+          <Placemark>
+            <Point>
+              <altitudeMode>relativeToGround</altitudeMode>
+              <coordinates>0,0,15</coordinates>
+            </Point>
+          </Placemark>
+          <Placemark>
+            <Point>
+              <altitudeMode>clampToGround</altitudeMode>
+              <coordinates>0,0,0</coordinates>
+            </Point>
+          </Placemark>
+          <Placemark>
+            <gx:Track>
+              <gx:altitudeMode>absolute</gx:altitudeMode>
+              <gx:coord>0 0 1</gx:coord>
+              <gx:coord>0.001 0 2</gx:coord>
+            </gx:Track>
+          </Placemark>
+        </kml>
+    "#;
+    let document = parse_kml(xml).expect("all geometries should parse");
+
+    assert!(document.tracks[0].segments[0]
+        .points
+        .iter()
+        .all(|point| point.altitude_reference == AltitudeReference::Absolute));
+    assert_eq!(
+        document.markers[0].point.altitude_reference,
+        AltitudeReference::RelativeToGround
+    );
+    assert_eq!(
+        document.markers[1].point.altitude_reference,
+        AltitudeReference::ClampToGround
+    );
+    assert!(document.tracks[1].segments[0]
+        .points
+        .iter()
+        .all(|point| point.altitude_reference == AltitudeReference::Absolute));
+}
+
+#[test]
+fn leaves_unspecified_altitude_reference_unknown() {
+    let xml = r#"<kml><Placemark><LineString><coordinates>0,0,10 0.001,0,20</coordinates></LineString></Placemark></kml>"#;
+    let document = parse_kml(xml).expect("valid track should parse");
+
+    assert!(document.tracks[0].segments[0]
+        .points
+        .iter()
+        .all(|point| point.altitude_reference == AltitudeReference::Unknown));
 }

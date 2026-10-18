@@ -1,7 +1,7 @@
 # VisualizeKML
 在三维空间中观看轨迹，掌握路线的高低俯仰之势。
 
-当前版本：**0.2.3**。支持提取 KML `Point` 标记，推断缺失的起点/终点，并标出轨迹全局最高点和最低点。
+当前版本：**0.3.0**。支持提取 KML `Point` 标记，推断缺失的起点/终点，并标出轨迹全局最高点和最低点。
 纬度增大映射为北向（+Z），经度增大映射为东向（+X）；初始视角中北向显示在上方、东向显示在右侧。
 南北方向统一依据带符号纬度差计算：北纬 30° 到 31°向北，南纬 30°S 到 31°S 向南；海拔仍独立映射到 +Y。
 
@@ -25,13 +25,18 @@ cargo run --release -- "D:\path\to\track.kml"
 visualize_kml.exe --version
 ```
 
-Windows Release 发布文件使用版本化名称 `dist/visualize_kml-0.2.3-windows-x86_64.exe`，
+轨迹按全部有效海拔范围从冷色渐变至暖色，并在界面图例中显示对应海拔范围（相对高度视觉编码，不代表温度）。
+缺少海拔的点使用中性色；轨迹无有效海拔或海拔全部相同时，整条轨迹使用中性色。多个轨迹段共享同一海拔范围。
+标记旁会显示有效且参考语义明确的高程（绝对高程取整为米，相对地面高程会标明参考面；未知或贴地模式不冒充绝对海拔）。
+方向箭头按每段累计路线距离每 500 m 布置，并根据当前屏幕间距隐藏重叠箭头；轨迹短于间隔时不强制添加箭头。
+
+Windows Release 发布文件使用版本化名称 `dist/visualize_kml-0.3.0-windows-x86_64.exe`，
 EXE 文件属性包含产品和文件版本。构建发布版本：
 
 ```powershell
 cargo build --release
 New-Item -ItemType Directory -Force dist | Out-Null
-Copy-Item target\release\visualize_kml.exe dist\visualize_kml-0.2.3-windows-x86_64.exe
+Copy-Item target\release\visualize_kml.exe dist\visualize_kml-0.3.0-windows-x86_64.exe
 ```
 
 窗口中按 `Ctrl+O` 可加载其他 KML 文件。鼠标左键拖动可旋转视角，滚轮可缩放。
@@ -43,7 +48,7 @@ Copy-Item target\release\visualize_kml.exe dist\visualize_kml-0.2.3-windows-x86_
 但不会加载描述中的远程图片或链接。中文标签使用系统已安装的中文字体。
 
 支持 `LineString`/`MultiGeometry` 的 `coordinates` 和 Google 扩展的 `gx:Track/gx:coord`。
-在线地图、海拔冷暖渐变、H 键快捷操作、右键平移、轨迹动画和 KML 样式渲染仍属于后续版本范围。
+在线地图、H 键快捷操作、右键平移、轨迹动画和 KML 样式渲染仍属于后续版本范围。
 
 ## 开发与测试
 

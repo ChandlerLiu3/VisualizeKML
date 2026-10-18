@@ -7,14 +7,19 @@ use std::sync::Arc;
 use visualize_kml::analysis::{AnalysisResult, AnalyzedMarker, MarkerKind, MarkerSource};
 use visualize_kml::camera::OrbitCamera;
 use visualize_kml::geometry::ProjectedTracks;
-use visualize_kml::TrackMarker;
+use visualize_kml::{AltitudeReference, TrackMarker};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
+
+const NEUTRAL_ELEVATION_COLOR: [f32; 3] = [0.68, 0.72, 0.76];
+const DIRECTION_ARROW_SPACING_METERS: f64 = 500.0;
+const MIN_DIRECTION_ARROW_SPACING_POINTS: f32 = 28.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TrajectoryVertex {
     position: [f32; 3],
+    color: [f32; 3],
 }
 
 #[repr(C)]
@@ -26,10 +31,25 @@ struct CameraUniform {
 struct SceneMarker {
     position: [f32; 3],
     route_direction: Option<Vec3>,
+    altitude: Option<f64>,
+    altitude_reference: AltitudeReference,
     kind: MarkerKind,
     source: MarkerSource,
     name: String,
     kml_metadata: Option<TrackMarker>,
+}
+
+struct SceneOverlay<'a> {
+    markers: &'a [SceneMarker],
+    warnings: &'a [String],
+    track_segments: &'a [Vec<[f32; 3]>],
+    track_distances: &'a [Vec<f64>],
+    altitude_range: Option<(f64, f64)>,
+    has_missing_altitude: bool,
+    view_projection: glam::Mat4,
+    width: u32,
+    height: u32,
+    pixels_per_point: f32,
 }
 
 #[derive(Debug)]
@@ -51,6 +71,10 @@ pub struct Renderer {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     segment_ranges: Vec<Range<u32>>,
+    track_segments: Vec<Vec<[f32; 3]>>,
+    track_distances: Vec<Vec<f64>>,
+    altitude_range: Option<(f64, f64)>,
+    has_missing_altitude: bool,
     camera: OrbitCamera,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
@@ -177,11 +201,18 @@ impl Renderer {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<TrajectoryVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                            shader_location: 1,
+                        },
+                    ],
                 }],
             },
             primitive: wgpu::PrimitiveState {
@@ -220,7 +251,10 @@ impl Renderer {
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("trajectory vertex buffer"),
-            contents: bytemuck::bytes_of(&TrajectoryVertex { position: [0.0; 3] }),
+            contents: bytemuck::bytes_of(&TrajectoryVertex {
+                position: [0.0; 3],
+                color: NEUTRAL_ELEVATION_COLOR,
+            }),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let depth_view = create_depth_view(&device, &config);
@@ -233,6 +267,10 @@ impl Renderer {
             render_pipeline,
             vertex_buffer,
             segment_ranges: Vec::new(),
+            track_segments: Vec::new(),
+            track_distances: Vec::new(),
+            altitude_range: None,
+            has_missing_altitude: false,
             camera,
             uniform_buffer,
             uniform_bind_group,
@@ -272,7 +310,7 @@ impl Renderer {
             .collect();
         let mut vertices = Vec::new();
         let mut ranges = Vec::new();
-        for segment in tracks.segments {
+        for (segment, altitudes) in tracks.segments.iter().zip(&tracks.altitudes) {
             if segment.is_empty() {
                 continue;
             }
@@ -280,8 +318,13 @@ impl Renderer {
                 .map_err(|_| RendererError("trajectory has too many vertices".to_owned()))?;
             vertices.extend(
                 segment
-                    .into_iter()
-                    .map(|position| TrajectoryVertex { position }),
+                    .iter()
+                    .copied()
+                    .zip(altitudes)
+                    .map(|(position, altitude)| TrajectoryVertex {
+                        position,
+                        color: elevation_color(*altitude, tracks.altitude_range),
+                    }),
             );
             let end = u32::try_from(vertices.len())
                 .map_err(|_| RendererError("trajectory has too many vertices".to_owned()))?;
@@ -301,6 +344,10 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
         self.segment_ranges = ranges;
+        self.track_segments = tracks.segments;
+        self.track_distances = tracks.distances;
+        self.altitude_range = tracks.altitude_range;
+        self.has_missing_altitude = tracks.altitudes.iter().flatten().any(Option::is_none);
         self.markers = scene_markers;
         self.warnings.clone_from(&self.system_warnings);
         self.warnings.extend(analysis.warnings);
@@ -397,6 +444,10 @@ impl Renderer {
             .view_projection(self.config.width as f32 / self.config.height as f32);
         let markers = &self.markers;
         let warnings = &self.warnings;
+        let track_segments = &self.track_segments;
+        let track_distances = &self.track_distances;
+        let altitude_range = self.altitude_range;
+        let has_missing_altitude = self.has_missing_altitude;
         let width = self.config.width;
         let height = self.config.height;
         let full_output = self.egui_context.run(
@@ -407,12 +458,18 @@ impl Renderer {
             |context| {
                 paint_scene_markers(
                     context,
-                    markers,
-                    warnings,
-                    view_projection,
-                    width,
-                    height,
-                    pixels_per_point,
+                    SceneOverlay {
+                        markers,
+                        warnings,
+                        track_segments,
+                        track_distances,
+                        altitude_range,
+                        has_missing_altitude,
+                        view_projection,
+                        width,
+                        height,
+                        pixels_per_point,
+                    },
                 );
             },
         );
@@ -494,6 +551,9 @@ fn scene_marker(tracks: &ProjectedTracks, marker: AnalyzedMarker) -> SceneMarker
     SceneMarker {
         position,
         route_direction,
+        altitude: (marker.point.has_altitude && marker.point.alt.is_finite())
+            .then_some(marker.point.alt),
+        altitude_reference: marker.point.altitude_reference,
         kind: marker.kind,
         source: marker.source,
         name: marker.name,
@@ -501,21 +561,44 @@ fn scene_marker(tracks: &ProjectedTracks, marker: AnalyzedMarker) -> SceneMarker
     }
 }
 
-fn paint_scene_markers(
-    context: &egui::Context,
-    markers: &[SceneMarker],
-    warnings: &[String],
-    view_projection: glam::Mat4,
-    width: u32,
-    height: u32,
-    pixels_per_point: f32,
-) {
+fn paint_scene_markers(context: &egui::Context, overlay: SceneOverlay<'_>) {
+    let SceneOverlay {
+        markers,
+        warnings,
+        track_segments,
+        track_distances,
+        altitude_range,
+        has_missing_altitude,
+        view_projection,
+        width,
+        height,
+        pixels_per_point,
+    } = overlay;
     let painter = context.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("scene-markers"),
     ));
     let logical_width = width as f32 / pixels_per_point;
     let logical_height = height as f32 / pixels_per_point;
+    let mut arrows = Vec::new();
+    for (segment, distances) in track_segments.iter().zip(track_distances) {
+        for (position, direction) in
+            direction_arrows_for_route(segment, distances, DIRECTION_ARROW_SPACING_METERS)
+        {
+            if let Some(arrow) = project_direction_arrow(
+                position,
+                direction,
+                view_projection,
+                logical_width,
+                logical_height,
+            ) {
+                arrows.push(arrow);
+            }
+        }
+    }
+    for (tip, direction) in hide_overlapping_arrows(arrows, MIN_DIRECTION_ARROW_SPACING_POINTS) {
+        paint_direction_arrow(&painter, tip, direction);
+    }
     for (index, marker) in markers.iter().enumerate() {
         let clip = view_projection
             * Vec4::new(
@@ -552,7 +635,11 @@ fn paint_scene_markers(
         let color = marker_color(marker.kind);
         paint_marker_shape(&painter, center, marker.kind, color, route_direction);
 
-        if let Some(label) = marker_label(&marker.name) {
+        if let Some(label) = marker_text(
+            marker_label(&marker.name),
+            marker.altitude,
+            marker.altitude_reference,
+        ) {
             painter.text(
                 center + egui::vec2(9.0, -14.0 - (index % 3) as f32 * 12.0),
                 egui::Align2::LEFT_CENTER,
@@ -575,10 +662,13 @@ fn paint_scene_markers(
             ui.label(format!("标记总数：{}", markers.len()));
             ui.separator();
             for marker in markers.iter().take(14) {
-                let response = ui.colored_label(
-                    marker_color(marker.kind),
-                    marker_label(&marker.name).unwrap_or(marker.kind.label()),
-                );
+                let label = marker_text(
+                    Some(marker_label(&marker.name).unwrap_or(marker.kind.label())),
+                    marker.altitude,
+                    marker.altitude_reference,
+                )
+                .unwrap_or_else(|| marker.kind.label().to_owned());
+                let response = ui.colored_label(marker_color(marker.kind), label);
                 if let Some(metadata) = &marker.kml_metadata {
                     let mut tooltip = String::new();
                     if let Some(id) = &metadata.id {
@@ -611,7 +701,215 @@ fn paint_scene_markers(
             for warning in warnings {
                 ui.colored_label(egui::Color32::YELLOW, warning);
             }
+            ui.separator();
+            paint_elevation_legend(ui, altitude_range, has_missing_altitude);
         });
+}
+
+fn elevation_color(altitude: Option<f64>, range: Option<(f64, f64)>) -> [f32; 3] {
+    let Some(altitude) = altitude.filter(|value| value.is_finite()) else {
+        return NEUTRAL_ELEVATION_COLOR;
+    };
+    let Some((minimum, maximum)) = range else {
+        return NEUTRAL_ELEVATION_COLOR;
+    };
+    if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
+        return NEUTRAL_ELEVATION_COLOR;
+    }
+
+    let scale = minimum.abs().max(maximum.abs()).max(altitude.abs());
+    let scaled_minimum = minimum / scale;
+    let scaled_maximum = maximum / scale;
+    let amount = ((altitude / scale - scaled_minimum) / (scaled_maximum - scaled_minimum))
+        .clamp(0.0, 1.0) as f32;
+    let low = [0.12, 0.42, 0.95];
+    let middle = [0.15, 0.78, 0.68];
+    let high = [0.98, 0.30, 0.12];
+    let (start, end, local_amount) = if amount <= 0.5 {
+        (low, middle, amount * 2.0)
+    } else {
+        (middle, high, (amount - 0.5) * 2.0)
+    };
+    std::array::from_fn(|index| start[index] + (end[index] - start[index]) * local_amount)
+}
+
+fn marker_text(
+    name: Option<&str>,
+    altitude: Option<f64>,
+    altitude_reference: AltitudeReference,
+) -> Option<String> {
+    let name = name.map(str::trim).filter(|name| !name.is_empty());
+    let altitude = altitude.filter(|value| value.is_finite());
+    let altitude_label = match (altitude, altitude_reference) {
+        (Some(altitude), AltitudeReference::Absolute) => Some(format!("{altitude:.0} m")),
+        (Some(altitude), AltitudeReference::RelativeToGround) => {
+            Some(format!("{altitude:.0} m（相对地面）"))
+        }
+        _ => None,
+    };
+    match (name, altitude_label) {
+        (Some(name), Some(altitude)) => Some(format!("{name} · {altitude}")),
+        (Some(name), None) => Some(name.to_owned()),
+        (None, altitude) => altitude,
+    }
+}
+
+fn paint_elevation_legend(
+    ui: &mut egui::Ui,
+    range: Option<(f64, f64)>,
+    has_missing_altitude: bool,
+) {
+    ui.label("海拔（相对高度）");
+    let (minimum, maximum) = match range {
+        Some((minimum, maximum)) if maximum > minimum => (minimum, maximum),
+        Some((minimum, _)) => {
+            ui.label(format!("海拔相同：{minimum} m（中性色）"));
+            if has_missing_altitude {
+                ui.small("缺少海拔的点使用中性色");
+            }
+            return;
+        }
+        None => {
+            ui.label("缺少有效海拔（中性色）");
+            return;
+        }
+    };
+    let (bar_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+    let steps = 32;
+    for step in 0..steps {
+        let x0 = egui::lerp(bar_rect.x_range(), step as f32 / steps as f32);
+        let x1 = egui::lerp(bar_rect.x_range(), (step + 1) as f32 / steps as f32);
+        let color = elevation_color(
+            Some(minimum + (maximum - minimum) * (step as f64 / (steps - 1) as f64)),
+            range,
+        );
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, bar_rect.top()),
+                egui::pos2(x1, bar_rect.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgb(
+                (color[0] * 255.0).round() as u8,
+                (color[1] * 255.0).round() as u8,
+                (color[2] * 255.0).round() as u8,
+            ),
+        );
+    }
+    ui.horizontal(|ui| {
+        ui.label(format!("{minimum} m"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format!("{maximum} m"));
+        });
+    });
+    if has_missing_altitude {
+        ui.small("缺少海拔的点使用中性色");
+    }
+}
+
+fn direction_arrows_for_route(
+    positions: &[[f32; 3]],
+    cumulative_distances: &[f64],
+    spacing_meters: f64,
+) -> Vec<([f32; 3], Vec3)> {
+    if positions.len() < 2
+        || positions.len() != cumulative_distances.len()
+        || !spacing_meters.is_finite()
+        || spacing_meters <= 0.0
+    {
+        return Vec::new();
+    }
+    let mut arrows = Vec::new();
+    let mut next_distance = spacing_meters;
+    for index in 0..positions.len() - 1 {
+        let start_distance = cumulative_distances[index];
+        let end_distance = cumulative_distances[index + 1];
+        let distance_delta = end_distance - start_distance;
+        if !start_distance.is_finite() || !end_distance.is_finite() || distance_delta <= 0.0 {
+            continue;
+        }
+        let start = Vec3::from_array(positions[index]);
+        let delta = Vec3::from_array(positions[index + 1]) - start;
+        while next_distance <= end_distance {
+            let amount = ((next_distance - start_distance) / distance_delta) as f32;
+            arrows.push(((start + delta * amount).to_array(), delta));
+            next_distance += spacing_meters;
+        }
+    }
+    arrows
+}
+
+fn project_direction_arrow(
+    position: [f32; 3],
+    direction: Vec3,
+    view_projection: glam::Mat4,
+    width: f32,
+    height: f32,
+) -> Option<(egui::Pos2, egui::Vec2)> {
+    if !direction.is_finite() || direction.length_squared() <= f32::EPSILON {
+        return None;
+    }
+    let clip = view_projection * Vec3::from_array(position).extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if !(-1.0..=1.0).contains(&ndc.x)
+        || !(-1.0..=1.0).contains(&ndc.y)
+        || !(0.0..=1.0).contains(&ndc.z)
+    {
+        return None;
+    }
+
+    let next_clip =
+        view_projection * (Vec3::from_array(position) + direction.normalize() * 0.01).extend(1.0);
+    if next_clip.w <= 0.0 {
+        return None;
+    }
+    let next_ndc = next_clip.truncate() / next_clip.w;
+    let screen_direction = egui::vec2(
+        (next_ndc.x - ndc.x) * width * 0.5,
+        (ndc.y - next_ndc.y) * height * 0.5,
+    );
+    if !screen_direction.is_finite() || screen_direction.length_sq() <= f32::EPSILON {
+        return None;
+    }
+    Some((
+        egui::pos2((ndc.x + 1.0) * 0.5 * width, (1.0 - ndc.y) * 0.5 * height),
+        screen_direction.normalized(),
+    ))
+}
+
+fn hide_overlapping_arrows(
+    arrows: Vec<(egui::Pos2, egui::Vec2)>,
+    minimum_spacing: f32,
+) -> Vec<(egui::Pos2, egui::Vec2)> {
+    if !minimum_spacing.is_finite() || minimum_spacing <= 0.0 {
+        return arrows;
+    }
+    let mut visible = Vec::new();
+    for arrow in arrows {
+        if visible
+            .iter()
+            .all(|(position, _): &(egui::Pos2, egui::Vec2)| {
+                position.distance(arrow.0) >= minimum_spacing
+            })
+        {
+            visible.push(arrow);
+        }
+    }
+    visible
+}
+
+fn paint_direction_arrow(painter: &egui::Painter, tip: egui::Pos2, direction: egui::Vec2) {
+    let direction = direction.normalized();
+    let wing = egui::vec2(-direction.y, direction.x);
+    let base = tip - direction * 8.0;
+    let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 235, 130));
+    painter.line_segment([base, tip], stroke);
+    painter.line_segment([tip, base + wing * 4.0], stroke);
+    painter.line_segment([tip, base - wing * 4.0], stroke);
 }
 
 fn marker_color(kind: MarkerKind) -> egui::Color32 {
@@ -797,6 +1095,121 @@ mod tests {
         assert!(cells.iter().all(|(rect, _)| {
             (rect.width() - 5.0).abs() < f32::EPSILON && (rect.height() - 5.0).abs() < f32::EPSILON
         }));
+    }
+
+    #[test]
+    fn elevation_colors_interpolate_from_cool_to_warm() {
+        let low = elevation_color(Some(0.0), Some((0.0, 100.0)));
+        let middle = elevation_color(Some(50.0), Some((0.0, 100.0)));
+        let high = elevation_color(Some(100.0), Some((0.0, 100.0)));
+
+        assert!(low[2] > low[0], "low altitude should use a cool blue");
+        assert!(middle.iter().all(|channel| (0.0..=1.0).contains(channel)));
+        assert!(high[0] > high[2], "high altitude should use a warm color");
+        assert_ne!(low, middle);
+        assert_ne!(middle, high);
+    }
+
+    #[test]
+    fn missing_and_flat_elevation_use_the_same_neutral_color() {
+        let missing = elevation_color(None, Some((0.0, 100.0)));
+        let flat = elevation_color(Some(50.0), Some((50.0, 50.0)));
+        let invalid_range = elevation_color(Some(50.0), None);
+
+        assert_eq!(missing, flat);
+        assert_eq!(flat, invalid_range);
+    }
+
+    #[test]
+    fn non_finite_marker_elevation_does_not_generate_a_label() {
+        assert_eq!(
+            marker_text(
+                Some(" Summit "),
+                Some(f64::NAN),
+                AltitudeReference::Absolute
+            ),
+            Some("Summit".to_owned())
+        );
+        assert_eq!(
+            elevation_color(Some(f64::INFINITY), Some((0.0, 100.0))),
+            NEUTRAL_ELEVATION_COLOR
+        );
+    }
+
+    #[test]
+    fn marker_elevation_is_shown_without_inventing_a_name() {
+        assert_eq!(
+            marker_text(Some(" Summit "), Some(123.4), AltitudeReference::Absolute),
+            Some("Summit · 123 m".to_owned())
+        );
+        assert_eq!(
+            marker_text(None, Some(-4.0), AltitudeReference::Absolute),
+            Some("-4 m".to_owned())
+        );
+        assert_eq!(
+            marker_text(
+                Some(" Camp "),
+                Some(4.4),
+                AltitudeReference::RelativeToGround
+            ),
+            Some("Camp · 4 m（相对地面）".to_owned())
+        );
+        assert_eq!(
+            marker_text(Some(" Summit "), Some(123.4), AltitudeReference::Unknown),
+            Some("Summit".to_owned())
+        );
+        assert_eq!(
+            marker_text(None, Some(123.4), AltitudeReference::Unknown),
+            None
+        );
+    }
+
+    #[test]
+    fn direction_arrows_use_route_distance_and_follow_local_segments() {
+        let positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+        let distances = [0.0, 400.0, 700.0];
+        let arrows = direction_arrows_for_route(&positions, &distances, 500.0);
+
+        assert_eq!(arrows.len(), 1);
+        assert!((arrows[0].0[0] - 1.0).abs() < f32::EPSILON);
+        assert!((arrows[0].0[1] - (1.0 / 3.0)).abs() < 1e-6);
+        assert!((arrows[0].1[1] - 1.0).abs() < f32::EPSILON);
+        assert!(direction_arrows_for_route(&positions[..2], &distances[..2], 500.0).is_empty());
+    }
+
+    #[test]
+    fn projected_direction_arrow_is_clipped_to_the_view_and_points_forward() {
+        let arrow =
+            project_direction_arrow([0.0, 0.0, 0.5], Vec3::X, glam::Mat4::IDENTITY, 200.0, 100.0)
+                .expect("visible route direction should project");
+
+        assert_eq!(arrow.0, egui::pos2(100.0, 50.0));
+        assert!(arrow.1.x > 0.99);
+        assert!(project_direction_arrow(
+            [2.0, 0.0, 0.5],
+            Vec3::X,
+            glam::Mat4::IDENTITY,
+            200.0,
+            100.0
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn screen_overlap_filter_keeps_only_visible_arrow_spacing() {
+        let arrows = vec![
+            (egui::pos2(0.0, 0.0), egui::vec2(1.0, 0.0)),
+            (egui::pos2(10.0, 0.0), egui::vec2(1.0, 0.0)),
+            (egui::pos2(40.0, 0.0), egui::vec2(1.0, 0.0)),
+        ];
+
+        assert_eq!(
+            hide_overlapping_arrows(arrows, 24.0)
+                .into_iter()
+                .map(|arrow| arrow.0)
+                .collect::<Vec<_>>(),
+            vec![egui::pos2(0.0, 0.0), egui::pos2(40.0, 0.0)]
+        );
     }
 
     #[cfg(target_os = "windows")]

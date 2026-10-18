@@ -8,12 +8,22 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum AltitudeReference {
+    Absolute,
+    RelativeToGround,
+    ClampToGround,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackPoint {
     pub lon: f64,
     pub lat: f64,
     pub alt: f64,
     pub has_altitude: bool,
+    pub altitude_reference: AltitudeReference,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -74,6 +84,7 @@ enum Capture {
     Coordinates,
     PointCoordinates,
     GxCoordinate,
+    AltitudeMode,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +95,7 @@ struct PlacemarkBuilder {
     style_url: Option<String>,
     extended_data: BTreeMap<String, String>,
     point: Option<TrackPoint>,
+    point_altitude_reference: AltitudeReference,
     has_point: bool,
 }
 
@@ -101,6 +113,8 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
     let mut line_segment = TrackSegment::default();
     let mut gx_segment = TrackSegment::default();
     let mut current_placemark: Option<PlacemarkBuilder> = None;
+    let mut line_altitude_reference = AltitudeReference::Unknown;
+    let mut gx_altitude_reference = AltitudeReference::Unknown;
 
     loop {
         match reader.read_event() {
@@ -111,9 +125,14 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                         id: element_attribute(&element, b"id")?,
                         ..PlacemarkBuilder::default()
                     });
+                } else if name == "LineString" {
+                    line_altitude_reference = AltitudeReference::Unknown;
+                } else if name == "Track" {
+                    gx_altitude_reference = AltitudeReference::Unknown;
                 } else if name == "Point" {
                     if let Some(placemark) = &mut current_placemark {
                         placemark.has_point = true;
+                        placemark.point_altitude_reference = AltitudeReference::Unknown;
                     }
                 }
                 if name == "Data" || name == "SimpleData" {
@@ -156,6 +175,9 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                     captured_text.clear();
                 } else if name == "coord" && stack.iter().any(|item| item == "Track") {
                     capture = Some(Capture::GxCoordinate);
+                    captured_text.clear();
+                } else if name == "altitudeMode" {
+                    capture = Some(Capture::AltitudeMode);
                     captured_text.clear();
                 }
                 stack.push(name);
@@ -253,6 +275,18 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                             append_unique(&mut gx_segment.points, point);
                         }
                     }
+                    Some(Capture::AltitudeMode) if name == "altitudeMode" => {
+                        let mode = parse_altitude_reference(&captured_text);
+                        if stack.iter().any(|item| item == "Point") {
+                            if let Some(placemark) = &mut current_placemark {
+                                placemark.point_altitude_reference = mode;
+                            }
+                        } else if stack.iter().any(|item| item == "Track") {
+                            gx_altitude_reference = mode;
+                        } else if stack.iter().any(|item| item == "LineString") {
+                            line_altitude_reference = mode;
+                        }
+                    }
                     other => {
                         capture = other;
                     }
@@ -262,11 +296,15 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                     data_name = None;
                 } else if name == "LineString" {
                     let segment = std::mem::take(&mut line_segment);
+                    let mut segment = segment;
+                    set_segment_altitude_reference(&mut segment, &line_altitude_reference);
                     if segment.points.len() >= 2 {
                         current_track.segments.push(segment);
                     }
                 } else if name == "Track" {
                     let segment = std::mem::take(&mut gx_segment);
+                    let mut segment = segment;
+                    set_segment_altitude_reference(&mut segment, &gx_altitude_reference);
                     if segment.points.len() >= 2 {
                         current_track.segments.push(segment);
                     }
@@ -275,7 +313,8 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                 }
                 if name == "Placemark" {
                     if let Some(placemark) = current_placemark.take() {
-                        if let Some(point) = placemark.point {
+                        if let Some(mut point) = placemark.point {
+                            point.altitude_reference = placemark.point_altitude_reference;
                             document.markers.push(TrackMarker {
                                 id: placemark.id,
                                 name: placemark.name,
@@ -405,6 +444,7 @@ fn parse_coordinate_tuple(text: &str, separator: char) -> Option<TrackPoint> {
         lat,
         alt,
         has_altitude,
+        altitude_reference: AltitudeReference::Unknown,
     })
 }
 
@@ -430,7 +470,23 @@ fn parse_gx_coordinate(text: &str) -> Option<TrackPoint> {
         lat,
         alt,
         has_altitude,
+        altitude_reference: AltitudeReference::Unknown,
     })
+}
+
+fn parse_altitude_reference(text: &str) -> AltitudeReference {
+    match text.trim() {
+        "absolute" => AltitudeReference::Absolute,
+        "relativeToGround" => AltitudeReference::RelativeToGround,
+        "clampToGround" => AltitudeReference::ClampToGround,
+        _ => AltitudeReference::Unknown,
+    }
+}
+
+fn set_segment_altitude_reference(segment: &mut TrackSegment, reference: &AltitudeReference) {
+    for point in &mut segment.points {
+        point.altitude_reference = *reference;
+    }
 }
 
 fn append_unique(points: &mut Vec<TrackPoint>, point: TrackPoint) {
