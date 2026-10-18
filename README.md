@@ -1,8 +1,9 @@
 # VisualizeKML
 在三维空间中观看轨迹，掌握路线的高低俯仰之势。
 
-当前版本：**0.2.2**。支持提取 KML `Point` 标记，推断缺失的起点/终点，并标出轨迹全局最高点和最低点。
+当前版本：**0.2.3**。支持提取 KML `Point` 标记，推断缺失的起点/终点，并标出轨迹全局最高点和最低点。
 纬度增大映射为北向（+Z），经度增大映射为东向（+X）；初始视角中北向显示在上方、东向显示在右侧。
+南北方向统一依据带符号纬度差计算：北纬 30° 到 31°向北，南纬 30°S 到 31°S 向南；海拔仍独立映射到 +Y。
 
 ## 运行
 
@@ -24,13 +25,13 @@ cargo run --release -- "D:\path\to\track.kml"
 visualize_kml.exe --version
 ```
 
-Windows Release 发布文件使用版本化名称 `dist/visualize_kml-0.2.2-windows-x86_64.exe`，
+Windows Release 发布文件使用版本化名称 `dist/visualize_kml-0.2.3-windows-x86_64.exe`，
 EXE 文件属性包含产品和文件版本。构建发布版本：
 
 ```powershell
 cargo build --release
 New-Item -ItemType Directory -Force dist | Out-Null
-Copy-Item target\release\visualize_kml.exe dist\visualize_kml-0.2.2-windows-x86_64.exe
+Copy-Item target\release\visualize_kml.exe dist\visualize_kml-0.2.3-windows-x86_64.exe
 ```
 
 窗口中按 `Ctrl+O` 可加载其他 KML 文件。鼠标左键拖动可旋转视角，滚轮可缩放。

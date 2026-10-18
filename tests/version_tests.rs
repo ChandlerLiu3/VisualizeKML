@@ -10,6 +10,6 @@ fn executable_reports_its_package_version() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("version output should be UTF-8"),
-        "VisualizeKML 0.2.2\n"
+        "VisualizeKML 0.2.3\n"
     );
 }

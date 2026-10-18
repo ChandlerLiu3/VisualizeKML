@@ -73,3 +73,41 @@ fn sample_route_preserves_east_west_direction_after_projection() {
         "the sample's easternmost route point must have a greater +X coordinate"
     );
 }
+
+#[test]
+fn real_sample_route_preserves_signed_latitude_direction() {
+    let document = parse_kml(include_str!("../sample.kml")).expect("sample KML should parse");
+    let projected = project_document(&document).expect("sample route should project");
+    let mut northward_steps = 0;
+    let mut southward_steps = 0;
+
+    for segment in document.tracks.iter().flat_map(|track| &track.segments) {
+        for pair in segment.points.windows(2) {
+            let latitude_delta = pair[1].lat - pair[0].lat;
+            if latitude_delta == 0.0 {
+                continue;
+            }
+            let northing_delta =
+                projected.project_point(&pair[1])[2] - projected.project_point(&pair[0])[2];
+            assert_eq!(
+                northing_delta.is_sign_positive(),
+                latitude_delta.is_sign_positive(),
+                "sample latitude delta must preserve its northing sign"
+            );
+            if latitude_delta > 0.0 {
+                northward_steps += 1;
+            } else {
+                southward_steps += 1;
+            }
+        }
+    }
+
+    assert!(
+        northward_steps > 0,
+        "sample should contain northbound steps"
+    );
+    assert!(
+        southward_steps > 0,
+        "sample should contain southbound steps"
+    );
+}
