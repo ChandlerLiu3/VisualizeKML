@@ -741,10 +741,10 @@ fn marker_text(
     let name = name.map(str::trim).filter(|name| !name.is_empty());
     let altitude = altitude.filter(|value| value.is_finite());
     let altitude_label = match (altitude, altitude_reference) {
-        (Some(altitude), AltitudeReference::Absolute) => Some(format!("{altitude:.0} m")),
-        (Some(altitude), AltitudeReference::RelativeToGround) => {
-            Some(format!("{altitude:.0} m（相对地面）"))
+        (Some(altitude), AltitudeReference::Absolute | AltitudeReference::RelativeToGround) => {
+            Some(format!("{altitude:.0}"))
         }
+        (Some(altitude), AltitudeReference::Unknown) => Some(format!("{altitude:.0}")),
         _ => None,
     };
     match (name, altitude_label) {
@@ -1140,11 +1140,11 @@ mod tests {
     fn marker_elevation_is_shown_without_inventing_a_name() {
         assert_eq!(
             marker_text(Some(" Summit "), Some(123.4), AltitudeReference::Absolute),
-            Some("Summit · 123 m".to_owned())
+            Some("Summit · 123".to_owned())
         );
         assert_eq!(
             marker_text(None, Some(-4.0), AltitudeReference::Absolute),
-            Some("-4 m".to_owned())
+            Some("-4".to_owned())
         );
         assert_eq!(
             marker_text(
@@ -1152,15 +1152,15 @@ mod tests {
                 Some(4.4),
                 AltitudeReference::RelativeToGround
             ),
-            Some("Camp · 4 m（相对地面）".to_owned())
+            Some("Camp · 4".to_owned())
         );
         assert_eq!(
             marker_text(Some(" Summit "), Some(123.4), AltitudeReference::Unknown),
-            Some("Summit".to_owned())
+            Some("Summit · 123".to_owned())
         );
         assert_eq!(
             marker_text(None, Some(123.4), AltitudeReference::Unknown),
-            None
+            Some("123".to_owned())
         );
     }
 
