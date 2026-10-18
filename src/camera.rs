@@ -17,7 +17,7 @@ impl OrbitCamera {
         let distance = distance.max(0.2);
         Self {
             target,
-            yaw: 0.0,
+            yaw: std::f32::consts::PI,
             pitch: 0.55,
             distance,
             min_distance: 0.05,
@@ -55,7 +55,8 @@ impl OrbitCamera {
         let view = Mat4::look_at_rh(eye, self.target, Vec3::Y);
         let projection =
             Mat4::perspective_rh(45.0_f32.to_radians(), aspect_ratio.max(0.01), 0.01, 1000.0);
-        projection * view
+        // ENU's east/up/north axes are left-handed; mirror view X to keep east on screen-right.
+        projection * view * Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0))
     }
 }
 
@@ -83,6 +84,28 @@ mod tests {
             .to_cols_array()
             .iter()
             .all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn initial_reference_view_projects_north_up_and_east_right() {
+        let camera = OrbitCamera::new(Vec3::ZERO, 3.0);
+        let view_projection = camera.view_projection(1.0);
+        let origin = view_projection * Vec3::ZERO.extend(1.0);
+        let north = view_projection * Vec3::Z.extend(1.0);
+        let east = view_projection * Vec3::X.extend(1.0);
+        let origin_y = origin.y / origin.w;
+        let north_y = north.y / north.w;
+        let origin_x = origin.x / origin.w;
+        let east_x = east.x / east.w;
+
+        assert!(
+            north_y > origin_y,
+            "north (+Z) must have a higher screen projection than the origin"
+        );
+        assert!(
+            east_x > origin_x,
+            "east (+X) must have a rightward screen projection in the north-up view"
+        );
     }
 
     #[test]

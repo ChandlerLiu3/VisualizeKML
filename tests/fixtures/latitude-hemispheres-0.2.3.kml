@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Latitude Hemisphere Regression 0.2.3</name>
+    <Placemark>
+      <name>North 30 to 31</name>
+      <LineString><coordinates>0,30,100 0,31,100</coordinates></LineString>
+    </Placemark>
+    <Placemark>
+      <name>South 30S to 31S</name>
+      <LineString><coordinates>0,-30,100 0,-31,100</coordinates></LineString>
+    </Placemark>
+  </Document>
+</kml>

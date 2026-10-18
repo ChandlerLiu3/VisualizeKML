@@ -1,4 +1,5 @@
-use visualize_kml::{parse_track_metadata, parse_track_points_from_kml};
+use visualize_kml::geometry::project_document;
+use visualize_kml::{parse_kml, parse_track_metadata, parse_track_points_from_kml};
 
 #[test]
 fn sample_kml_can_be_parsed_into_points() {
@@ -43,5 +44,70 @@ fn sample_kml_metadata_is_extracted() {
     assert!(
         (distance - 9110.99625616947).abs() < 1e-6,
         "distance should match sample metadata"
+    );
+}
+
+#[test]
+fn sample_route_preserves_east_west_direction_after_projection() {
+    let document = parse_kml(include_str!("../sample.kml")).expect("sample KML should parse");
+    let projected = project_document(&document).expect("sample route should project");
+    let points: Vec<_> = document
+        .tracks
+        .iter()
+        .flat_map(|track| &track.segments)
+        .flat_map(|segment| &segment.points)
+        .collect();
+    let westernmost = points
+        .iter()
+        .copied()
+        .min_by(|left, right| left.lon.total_cmp(&right.lon))
+        .expect("sample should have route points");
+    let easternmost = points
+        .iter()
+        .copied()
+        .max_by(|left, right| left.lon.total_cmp(&right.lon))
+        .expect("sample should have route points");
+
+    assert!(
+        projected.project_point(easternmost)[0] > projected.project_point(westernmost)[0],
+        "the sample's easternmost route point must have a greater +X coordinate"
+    );
+}
+
+#[test]
+fn real_sample_route_preserves_signed_latitude_direction() {
+    let document = parse_kml(include_str!("../sample.kml")).expect("sample KML should parse");
+    let projected = project_document(&document).expect("sample route should project");
+    let mut northward_steps = 0;
+    let mut southward_steps = 0;
+
+    for segment in document.tracks.iter().flat_map(|track| &track.segments) {
+        for pair in segment.points.windows(2) {
+            let latitude_delta = pair[1].lat - pair[0].lat;
+            if latitude_delta == 0.0 {
+                continue;
+            }
+            let northing_delta =
+                projected.project_point(&pair[1])[2] - projected.project_point(&pair[0])[2];
+            assert_eq!(
+                northing_delta.is_sign_positive(),
+                latitude_delta.is_sign_positive(),
+                "sample latitude delta must preserve its northing sign"
+            );
+            if latitude_delta > 0.0 {
+                northward_steps += 1;
+            } else {
+                southward_steps += 1;
+            }
+        }
+    }
+
+    assert!(
+        northward_steps > 0,
+        "sample should contain northbound steps"
+    );
+    assert!(
+        southward_steps > 0,
+        "sample should contain southbound steps"
     );
 }
