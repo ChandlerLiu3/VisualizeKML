@@ -4,7 +4,7 @@ use visualize_kml::{parse_kml, parse_track_metadata, parse_track_points_from_kml
 #[test]
 fn sample_kml_can_be_parsed_into_points() {
     let xml = include_str!("../sample.kml");
-    let points = parse_track_points_from_kml(xml);
+    let points = parse_track_points_from_kml(xml).expect("sample KML should parse");
 
     assert!(
         !points.is_empty(),
@@ -31,7 +31,7 @@ fn sample_kml_can_be_parsed_into_points() {
 #[test]
 fn sample_kml_metadata_is_extracted() {
     let xml = include_str!("../sample.kml");
-    let (name, sport, distance) = parse_track_metadata(xml);
+    let (name, sport, distance) = parse_track_metadata(xml).expect("sample KML should parse");
 
     assert_eq!(
         name, "2025-10-14 11:09:28",

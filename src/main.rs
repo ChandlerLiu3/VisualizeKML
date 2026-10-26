@@ -143,6 +143,9 @@ impl ViewerApp {
                 self.last_cursor_position = None;
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_cursor_position(position.x, position.y);
+                }
                 if self.dragging {
                     if let Some((last_x, last_y)) = self.last_cursor_position {
                         let scale = self
@@ -154,10 +157,18 @@ impl ViewerApp {
                         if let Some(renderer) = &mut self.renderer {
                             renderer.orbit(dx, dy);
                         }
-                        self.request_redraw();
                     }
                 }
                 self.last_cursor_position = Some((position.x, position.y));
+                // egui needs a frame to react to the new pointer position so
+                // hover tooltips appear even while the camera is idle.
+                self.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.clear_cursor_position();
+                }
+                self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let amount = match delta {

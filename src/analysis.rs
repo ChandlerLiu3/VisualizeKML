@@ -1,10 +1,15 @@
 use crate::{KmlDocument, TrackMarker, TrackPoint};
 
+/// Minimum elevation prominence before an inferred terrain marker is proposed.
+///
+/// Terrain inference is experimental and only compiled with the
+/// `terrain-candidates` cargo feature.
 pub const MIN_TERRAIN_PROMINENCE_METERS: f64 = 30.0;
+/// Minimum spacing between two inferred terrain markers.
 pub const MIN_TERRAIN_MARKER_DISTANCE_METERS: f64 = 500.0;
 const DUPLICATE_MARKER_DISTANCE_METERS: f64 = 5.0;
+#[cfg(feature = "terrain-candidates")]
 const EXPLICIT_MATCH_DISTANCE_METERS: f64 = 20.0;
-const LOCAL_PEAK_VALIDATION_PASSED: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkerKind {
@@ -38,6 +43,7 @@ impl MarkerKind {
         }
     }
 
+    #[cfg(feature = "terrain-candidates")]
     fn explicit_kind(self) -> Option<Self> {
         match self {
             Self::Peak => Some(Self::PeakCandidate),
@@ -119,7 +125,7 @@ pub fn analyze_document(document: &KmlDocument) -> AnalysisResult {
     let altitude_points: Vec<&TrackPoint> = ordered_points
         .iter()
         .copied()
-        .filter(|point| point.has_altitude && point.alt.is_finite())
+        .filter(|point| point.usable_altitude().is_some())
         .collect();
 
     if let Some(highest) =
@@ -162,15 +168,21 @@ pub fn analyze_document(document: &KmlDocument) -> AnalysisResult {
         );
     }
 
-    if LOCAL_PEAK_VALIDATION_PASSED {
-        for segment in &segments {
-            for run in altitude_runs(segment) {
-                add_peak_candidates(&mut result, run);
-            }
-        }
-    }
+    // Terrain inference stays opt-in until it has been validated against real
+    // tracks; the default build only derives markers that are backed by data.
+    #[cfg(feature = "terrain-candidates")]
+    add_terrain_candidates(&mut result, &segments);
 
     result
+}
+
+#[cfg(feature = "terrain-candidates")]
+fn add_terrain_candidates(result: &mut AnalysisResult, segments: &[&[TrackPoint]]) {
+    for &segment in segments {
+        for run in altitude_runs(segment) {
+            add_peak_candidates(result, run);
+        }
+    }
 }
 
 fn add_endpoint_if_missing(
@@ -227,11 +239,12 @@ fn contains_any(text: &str, terms: &[&str]) -> bool {
     terms.iter().any(|term| text.contains(term))
 }
 
+#[cfg(feature = "terrain-candidates")]
 fn altitude_runs(points: &[TrackPoint]) -> Vec<&[TrackPoint]> {
     let mut runs = Vec::new();
     let mut start = None;
     for (index, point) in points.iter().enumerate() {
-        if point.has_altitude && point.alt.is_finite() {
+        if point.usable_altitude().is_some() {
             start.get_or_insert(index);
         } else if let Some(run_start) = start.take() {
             runs.push(&points[run_start..index]);
@@ -243,6 +256,7 @@ fn altitude_runs(points: &[TrackPoint]) -> Vec<&[TrackPoint]> {
     runs
 }
 
+#[cfg(feature = "terrain-candidates")]
 fn add_peak_candidates(result: &mut AnalysisResult, points: &[TrackPoint]) {
     if points.len() < 3 {
         return;
@@ -271,11 +285,13 @@ fn add_peak_candidates(result: &mut AnalysisResult, points: &[TrackPoint]) {
     }
 }
 
+#[cfg(feature = "terrain-candidates")]
 #[derive(Default)]
 struct Extrema {
     peaks: Vec<usize>,
 }
 
+#[cfg(feature = "terrain-candidates")]
 fn local_extrema(elevations: &[f64]) -> Extrema {
     let mut extrema = Extrema::default();
     let mut start = 0;
@@ -300,6 +316,7 @@ fn local_extrema(elevations: &[f64]) -> Extrema {
     extrema
 }
 
+#[cfg(feature = "terrain-candidates")]
 fn prominent_extrema(
     points: &[TrackPoint],
     candidates: &[usize],
@@ -328,6 +345,7 @@ fn prominent_extrema(
     selected
 }
 
+#[cfg(feature = "terrain-candidates")]
 fn prominence_at(index: usize, elevations: &[f64]) -> f64 {
     let left = &elevations[..index];
     let right = &elevations[index + 1..];
@@ -335,6 +353,7 @@ fn prominence_at(index: usize, elevations: &[f64]) -> f64 {
         .min(elevations[index] - right.iter().copied().fold(f64::INFINITY, f64::min))
 }
 
+#[cfg(feature = "terrain-candidates")]
 fn has_explicit_near(
     result: &AnalysisResult,
     candidate_kind: MarkerKind,

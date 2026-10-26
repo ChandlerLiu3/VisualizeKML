@@ -30,11 +30,9 @@ impl ProjectedTracks {
         let delta_lon = (point.lon - self.projection.origin_lon + 180.0).rem_euclid(360.0) - 180.0;
         let local = [
             EARTH_RADIUS_METERS * delta_lon.to_radians() * self.projection.origin_lat_radians.cos(),
-            if point.has_altitude {
-                effective_altitude(point) - self.projection.origin_alt
-            } else {
-                0.0
-            },
+            point
+                .usable_altitude()
+                .map_or(0.0, |altitude| altitude - self.projection.origin_alt),
             EARTH_RADIUS_METERS * (point.lat - self.projection.origin_lat).to_radians(),
         ];
         [
@@ -115,37 +113,31 @@ pub fn project_segments(segments: &[&TrackSegment]) -> Result<ProjectedTracks, G
         .iter()
         .map(|point| point.lat)
         .fold(f64::NEG_INFINITY, f64::max);
-    let alt_min = points
+    let altitude_values: Vec<f64> = points
         .iter()
-        .map(|point| effective_altitude(point))
+        .filter_map(|point| point.usable_altitude())
+        .collect();
+    let alt_min = altitude_values
+        .iter()
+        .copied()
         .fold(f64::INFINITY, f64::min);
-    let alt_max = points
+    let alt_max = altitude_values
         .iter()
-        .map(|point| effective_altitude(point))
+        .copied()
         .fold(f64::NEG_INFINITY, f64::max);
 
     let origin_lon = (lon_min + lon_max) * 0.5;
     let origin_lat = (lat_min + lat_max) * 0.5;
-    let origin_alt = (alt_min + alt_max) * 0.5;
+    let origin_alt = if altitude_values.is_empty() {
+        0.0
+    } else {
+        (alt_min + alt_max) * 0.5
+    };
     let origin_lat_radians = origin_lat.to_radians();
-    let altitude_values: Vec<f64> = points
-        .iter()
-        .filter(|point| point.has_altitude && point.alt.is_finite())
-        .map(|point| point.alt)
-        .collect();
     let altitude_range = if altitude_values.is_empty() {
         None
     } else {
-        Some((
-            altitude_values
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min),
-            altitude_values
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max),
-        ))
+        Some((alt_min, alt_max))
     };
 
     let enu_segments: Vec<Vec<[f64; 3]>> = segments
@@ -159,7 +151,10 @@ pub fn project_segments(segments: &[&TrackSegment]) -> Result<ProjectedTracks, G
                     let east =
                         EARTH_RADIUS_METERS * delta_lon.to_radians() * origin_lat_radians.cos();
                     let north = EARTH_RADIUS_METERS * (point.lat - origin_lat).to_radians();
-                    [east, effective_altitude(point) - origin_alt, north]
+                    let up = point
+                        .usable_altitude()
+                        .map_or(0.0, |altitude| altitude - origin_alt);
+                    [east, up, north]
                 })
                 .collect()
         })
@@ -170,7 +165,7 @@ pub fn project_segments(segments: &[&TrackSegment]) -> Result<ProjectedTracks, G
             segment
                 .points
                 .iter()
-                .map(|point| (point.has_altitude && point.alt.is_finite()).then_some(point.alt))
+                .map(TrackPoint::usable_altitude)
                 .collect()
         })
         .collect();
@@ -259,14 +254,6 @@ pub fn project_segments(segments: &[&TrackSegment]) -> Result<ProjectedTracks, G
             scale,
         },
     })
-}
-
-fn effective_altitude(point: &TrackPoint) -> f64 {
-    if point.has_altitude && point.alt.is_finite() {
-        point.alt
-    } else {
-        0.0
-    }
 }
 
 #[cfg(test)]
@@ -562,5 +549,68 @@ mod tests {
         assert!(projected.distances[0][2] > 222.0 && projected.distances[0][2] < 223.0);
         assert_eq!(projected.distances[1][0], 0.0);
         assert!(projected.distances[1][1] > 111.0 && projected.distances[1][1] < 112.0);
+    }
+
+    #[test]
+    fn clamp_to_ground_altitudes_do_not_create_an_elevation_range() {
+        let segment = TrackSegment {
+            points: vec![
+                TrackPoint {
+                    lon: 10.0,
+                    lat: 20.0,
+                    alt: 120.0,
+                    has_altitude: true,
+                    altitude_reference: crate::AltitudeReference::ClampToGround,
+                },
+                TrackPoint {
+                    lon: 10.01,
+                    lat: 20.0,
+                    alt: 620.0,
+                    has_altitude: true,
+                    altitude_reference: crate::AltitudeReference::ClampToGround,
+                },
+            ],
+        };
+        let projected = project_segments(&[&segment]).expect("clamped route should project");
+
+        assert_eq!(projected.altitude_range, None);
+        assert_eq!(projected.altitudes, vec![vec![None, None]]);
+        assert!(
+            (projected.segments[0][0][1] - projected.segments[0][1][1]).abs() < 1e-6,
+            "clamped points must share one ground plane"
+        );
+    }
+
+    #[test]
+    fn markers_without_altitude_share_the_track_vertical_origin() {
+        let segment = TrackSegment {
+            points: vec![
+                TrackPoint {
+                    lon: 115.0,
+                    lat: 39.0,
+                    alt: 0.0,
+                    has_altitude: false,
+                    altitude_reference: crate::AltitudeReference::Unknown,
+                },
+                TrackPoint {
+                    lon: 115.01,
+                    lat: 39.01,
+                    alt: 100.0,
+                    has_altitude: true,
+                    altitude_reference: crate::AltitudeReference::Absolute,
+                },
+                TrackPoint {
+                    lon: 115.02,
+                    lat: 39.02,
+                    alt: 300.0,
+                    has_altitude: true,
+                    altitude_reference: crate::AltitudeReference::Absolute,
+                },
+            ],
+        };
+        let projected = project_segments(&[&segment]).expect("route should project");
+        let marker_position = projected.project_point(&segment.points[0]);
+
+        assert_eq!(marker_position, projected.segments[0][0]);
     }
 }

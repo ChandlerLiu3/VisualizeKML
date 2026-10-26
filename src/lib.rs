@@ -26,6 +26,20 @@ pub struct TrackPoint {
     pub altitude_reference: AltitudeReference,
 }
 
+impl TrackPoint {
+    /// Altitude that can be used for display, or `None` when the source does not
+    /// define one.
+    ///
+    /// `clampToGround` points are pinned to terrain, so any altitude value stored
+    /// in the file is not meaningful for rendering.
+    pub fn usable_altitude(&self) -> Option<f64> {
+        if self.altitude_reference == AltitudeReference::ClampToGround {
+            return None;
+        }
+        (self.has_altitude && self.alt.is_finite()).then_some(self.alt)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TrackSegment {
     pub points: Vec<TrackPoint>,
@@ -245,17 +259,14 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                         }
                         match key.as_str() {
                             "SportTypeName" => document.sport = value.to_owned(),
-                            "Distance" if !value.is_empty() => {
-                                let distance = value.parse::<f64>().map_err(|error| {
-                                    KmlError::Xml(format!("invalid Distance value: {error}"))
-                                })?;
-                                if !distance.is_finite() {
-                                    return Err(KmlError::Xml(
-                                        "Distance value must be finite".to_owned(),
-                                    ));
+                            "Distance" if !value.is_empty() => match value.parse::<f64>() {
+                                Ok(distance) if distance.is_finite() => {
+                                    document.distance = distance;
                                 }
-                                document.distance = distance;
-                            }
+                                _ => document.warnings.push(format!(
+                                    "Distance 元数据 \"{value}\" 不是有效数字，已忽略"
+                                )),
+                            },
                             _ => {}
                         }
                     }
@@ -309,6 +320,13 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
                         current_track.segments.push(segment);
                     }
                 } else if name == "Placemark" && !current_track.segments.is_empty() {
+                    if current_track.name.is_none() {
+                        current_track.name = current_placemark
+                            .as_ref()
+                            .map(|placemark| placemark.name.trim())
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned);
+                    }
                     tracks.push(std::mem::take(&mut current_track));
                 }
                 if name == "Placemark" {
@@ -361,19 +379,18 @@ pub fn parse_kml(xml: &str) -> Result<KmlDocument, KmlError> {
     Ok(document)
 }
 
-pub fn parse_track_points_from_kml(xml: &str) -> Vec<TrackPoint> {
-    parse_kml(xml)
-        .expect("KML must contain valid track data")
+pub fn parse_track_points_from_kml(xml: &str) -> Result<Vec<TrackPoint>, KmlError> {
+    Ok(parse_kml(xml)?
         .tracks
         .into_iter()
         .flat_map(|track| track.segments)
         .flat_map(|segment| segment.points)
-        .collect()
+        .collect())
 }
 
-pub fn parse_track_metadata(xml: &str) -> (String, String, f64) {
-    let document = parse_kml(xml).expect("KML must contain valid track data");
-    (document.name, document.sport, document.distance)
+pub fn parse_track_metadata(xml: &str) -> Result<(String, String, f64), KmlError> {
+    let document = parse_kml(xml)?;
+    Ok((document.name, document.sport, document.distance))
 }
 
 fn local_name(name: &[u8]) -> String {
@@ -492,5 +509,44 @@ fn set_segment_altitude_reference(segment: &mut TrackSegment, reference: &Altitu
 fn append_unique(points: &mut Vec<TrackPoint>, point: TrackPoint) {
     if points.last() != Some(&point) {
         points.push(point);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(alt: f64, has_altitude: bool, reference: AltitudeReference) -> TrackPoint {
+        TrackPoint {
+            lon: 0.0,
+            lat: 0.0,
+            alt,
+            has_altitude,
+            altitude_reference: reference,
+        }
+    }
+
+    #[test]
+    fn usable_altitude_ignores_clamp_to_ground_and_missing_values() {
+        assert_eq!(
+            point(120.0, true, AltitudeReference::Absolute).usable_altitude(),
+            Some(120.0)
+        );
+        assert_eq!(
+            point(120.0, true, AltitudeReference::RelativeToGround).usable_altitude(),
+            Some(120.0)
+        );
+        assert_eq!(
+            point(120.0, true, AltitudeReference::ClampToGround).usable_altitude(),
+            None
+        );
+        assert_eq!(
+            point(120.0, false, AltitudeReference::Unknown).usable_altitude(),
+            None
+        );
+        assert_eq!(
+            point(f64::NAN, true, AltitudeReference::Unknown).usable_altitude(),
+            None
+        );
     }
 }

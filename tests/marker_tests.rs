@@ -95,6 +95,7 @@ fn prefers_explicit_start_and_end_and_infers_highest_from_track() {
     );
 }
 
+#[cfg(not(feature = "terrain-candidates"))]
 #[test]
 fn infers_start_end_without_unvalidated_terrain_candidates() {
     let xml = r#"
@@ -209,6 +210,7 @@ fn emits_global_highest_and_lowest_without_synthesized_names_or_local_candidates
     assert_eq!(lowest.point.alt, -40.0);
     assert!(highest.name.is_empty());
     assert!(lowest.name.is_empty());
+    #[cfg(not(feature = "terrain-candidates"))]
     assert!(markers.markers.iter().all(|marker| !matches!(
         marker.kind,
         MarkerKind::PeakCandidate | MarkerKind::PassCandidate | MarkerKind::ValleyCandidate
@@ -324,8 +326,7 @@ fn sample_kml_provides_explicit_endpoints_without_unvalidated_local_candidates()
         .iter()
         .flat_map(|track| &track.segments)
         .flat_map(|segment| &segment.points)
-        .filter(|point| point.has_altitude)
-        .map(|point| point.alt)
+        .filter_map(|point| point.usable_altitude())
         .fold(f64::NEG_INFINITY, f64::max);
     assert_eq!(
         analysis
@@ -337,8 +338,28 @@ fn sample_kml_provides_explicit_endpoints_without_unvalidated_local_candidates()
             .alt,
         highest_track_altitude
     );
+    #[cfg(not(feature = "terrain-candidates"))]
     assert!(!analysis.markers.iter().any(|marker| matches!(
         marker.kind,
         MarkerKind::PeakCandidate | MarkerKind::PassCandidate | MarkerKind::ValleyCandidate
     )));
+}
+
+#[cfg(feature = "terrain-candidates")]
+#[test]
+fn derives_prominent_peak_candidates_when_the_feature_is_enabled() {
+    let xml = r#"
+        <kml><Placemark><LineString><coordinates>
+          10,20,0 10.01,20,200 10.02,20,0
+        </coordinates></LineString></Placemark></kml>
+    "#;
+    let analysis = analyze_document(&parse_kml(xml).expect("valid track should parse"));
+    let peak = analysis
+        .markers
+        .iter()
+        .find(|marker| marker.kind == MarkerKind::PeakCandidate)
+        .expect("a prominent local peak should be inferred");
+
+    assert_eq!(peak.source, MarkerSource::ElevationProfile);
+    assert_eq!(peak.point.alt, 200.0);
 }

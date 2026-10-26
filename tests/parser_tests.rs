@@ -37,6 +37,33 @@ fn parses_linestring_and_multigeometry_into_separate_segments() {
 }
 
 #[test]
+fn attaches_the_placemark_name_to_its_track() {
+    let xml = r#"
+        <kml><Document>
+          <Placemark>
+            <name>Ridge traverse</name>
+            <LineString><coordinates>10,20,0 10.01,20,1</coordinates></LineString>
+          </Placemark>
+          <Placemark>
+            <LineString><coordinates>11,21,0 11.01,21,1</coordinates></LineString>
+          </Placemark>
+        </Document></kml>
+    "#;
+
+    let document = parse_kml(xml).expect("named tracks should parse");
+    assert_eq!(document.tracks.len(), 2);
+    assert_eq!(
+        document.tracks[0].name.as_deref(),
+        Some("Ridge traverse"),
+        "the track should keep the placemark name"
+    );
+    assert_eq!(
+        document.tracks[1].name, None,
+        "unnamed placemarks must not invent a track name"
+    );
+}
+
+#[test]
 fn ignores_invalid_coordinates_but_reports_documents_without_tracks() {
     let xml = r#"<kml><Placemark><LineString><coordinates>181,0,1 10,91,2 10,20,NaN 11,21,4 12,22,5</coordinates></LineString></Placemark></kml>"#;
     let document = parse_kml(xml).expect("at least one valid coordinate should be retained");
@@ -61,9 +88,15 @@ fn reports_malformed_xml() {
 }
 
 #[test]
-fn reports_invalid_numeric_metadata() {
+fn invalid_distance_metadata_is_a_warning_instead_of_a_parse_error() {
     let xml = r#"<kml><Document><ExtendedData><Data name="Distance"><value>unknown</value></Data></ExtendedData><Placemark><LineString><coordinates>0,0 1,1</coordinates></LineString></Placemark></Document></kml>"#;
-    assert!(matches!(parse_kml(xml), Err(KmlError::Xml(_))));
+    let document = parse_kml(xml).expect("a bad Distance value must not hide the track");
+
+    assert_eq!(document.distance, 0.0);
+    assert!(document
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("Distance")));
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec3, Vec4};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::ops::Range;
@@ -7,7 +8,7 @@ use std::sync::Arc;
 use visualize_kml::analysis::{AnalysisResult, AnalyzedMarker, MarkerKind, MarkerSource};
 use visualize_kml::camera::OrbitCamera;
 use visualize_kml::geometry::ProjectedTracks;
-use visualize_kml::{AltitudeReference, TrackMarker};
+use visualize_kml::TrackMarker;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -32,7 +33,6 @@ struct SceneMarker {
     position: [f32; 3],
     route_direction: Option<Vec3>,
     altitude: Option<f64>,
-    altitude_reference: AltitudeReference,
     kind: MarkerKind,
     source: MarkerSource,
     name: String,
@@ -42,8 +42,7 @@ struct SceneMarker {
 struct SceneOverlay<'a> {
     markers: &'a [SceneMarker],
     warnings: &'a [String],
-    track_segments: &'a [Vec<[f32; 3]>],
-    track_distances: &'a [Vec<f64>],
+    arrows: &'a [([f32; 3], Vec3)],
     altitude_range: Option<(f64, f64)>,
     has_missing_altitude: bool,
     view_projection: glam::Mat4,
@@ -71,8 +70,7 @@ pub struct Renderer {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     segment_ranges: Vec<Range<u32>>,
-    track_segments: Vec<Vec<[f32; 3]>>,
-    track_distances: Vec<Vec<f64>>,
+    arrows: Vec<([f32; 3], Vec3)>,
     altitude_range: Option<(f64, f64)>,
     has_missing_altitude: bool,
     camera: OrbitCamera,
@@ -85,6 +83,9 @@ pub struct Renderer {
     markers: Vec<SceneMarker>,
     warnings: Vec<String>,
     system_warnings: Vec<String>,
+    cursor_position: Option<(f64, f64)>,
+    last_sent_pointer: Option<egui::Pos2>,
+    start_time: std::time::Instant,
 }
 
 impl Renderer {
@@ -247,6 +248,7 @@ impl Renderer {
         });
 
         let egui_context = egui::Context::default();
+        configure_egui_style(&egui_context);
         let has_cjk_font = load_cjk_font(&egui_context);
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -258,6 +260,11 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX,
         });
         let depth_view = create_depth_view(&device, &config);
+        let system_warnings = if has_cjk_font {
+            Vec::new()
+        } else {
+            vec!["No system CJK font was found; Chinese marker labels may not display".to_owned()]
+        };
 
         Ok(Self {
             surface,
@@ -267,8 +274,7 @@ impl Renderer {
             render_pipeline,
             vertex_buffer,
             segment_ranges: Vec::new(),
-            track_segments: Vec::new(),
-            track_distances: Vec::new(),
+            arrows: Vec::new(),
             altitude_range: None,
             has_missing_altitude: false,
             camera,
@@ -279,22 +285,11 @@ impl Renderer {
             egui_context,
             egui_renderer,
             markers: Vec::new(),
-            system_warnings: if has_cjk_font {
-                Vec::new()
-            } else {
-                vec![
-                    "No system CJK font was found; Chinese marker labels may not display"
-                        .to_owned(),
-                ]
-            },
-            warnings: if has_cjk_font {
-                Vec::new()
-            } else {
-                vec![
-                    "No system CJK font was found; Chinese marker labels may not display"
-                        .to_owned(),
-                ]
-            },
+            system_warnings: system_warnings.clone(),
+            warnings: system_warnings,
+            cursor_position: None,
+            last_sent_pointer: None,
+            start_time: std::time::Instant::now(),
         })
     }
 
@@ -343,9 +338,16 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+        let arrows: Vec<([f32; 3], Vec3)> = tracks
+            .segments
+            .iter()
+            .zip(&tracks.distances)
+            .flat_map(|(segment, distances)| {
+                direction_arrows_for_route(segment, distances, DIRECTION_ARROW_SPACING_METERS)
+            })
+            .collect();
         self.segment_ranges = ranges;
-        self.track_segments = tracks.segments;
-        self.track_distances = tracks.distances;
+        self.arrows = arrows;
         self.altitude_range = tracks.altitude_range;
         self.has_missing_altitude = tracks.altitudes.iter().flatten().any(Option::is_none);
         self.markers = scene_markers;
@@ -363,6 +365,17 @@ impl Renderer {
 
     pub fn zoom(&mut self, delta: f32) {
         self.camera.zoom(delta);
+    }
+
+    /// Stores the cursor position in physical pixels so egui can hover widgets.
+    pub fn set_cursor_position(&mut self, x: f64, y: f64) {
+        if x.is_finite() && y.is_finite() {
+            self.cursor_position = Some((x, y));
+        }
+    }
+
+    pub fn clear_cursor_position(&mut self) {
+        self.cursor_position = None;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -432,6 +445,11 @@ impl Renderer {
         }
 
         let pixels_per_point = self.window.scale_factor() as f32;
+        let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
         let screen_rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(
@@ -444,35 +462,32 @@ impl Renderer {
             .view_projection(self.config.width as f32 / self.config.height as f32);
         let markers = &self.markers;
         let warnings = &self.warnings;
-        let track_segments = &self.track_segments;
-        let track_distances = &self.track_distances;
+        let arrows = &self.arrows;
         let altitude_range = self.altitude_range;
         let has_missing_altitude = self.has_missing_altitude;
         let width = self.config.width;
         let height = self.config.height;
-        let full_output = self.egui_context.run(
-            egui::RawInput {
-                screen_rect: Some(screen_rect),
-                ..Default::default()
-            },
-            |context| {
-                paint_scene_markers(
-                    context,
-                    SceneOverlay {
-                        markers,
-                        warnings,
-                        track_segments,
-                        track_distances,
-                        altitude_range,
-                        has_missing_altitude,
-                        view_projection,
-                        width,
-                        height,
-                        pixels_per_point,
-                    },
-                );
-            },
-        );
+        let pointer = pointer_position(self.cursor_position, pixels_per_point);
+        let events = pointer_events(pointer, self.last_sent_pointer);
+        self.last_sent_pointer = pointer;
+        let raw_input =
+            egui_raw_input(screen_rect, events, self.start_time.elapsed().as_secs_f64());
+        let full_output = self.egui_context.run(raw_input, |context| {
+            paint_scene_markers(
+                context,
+                SceneOverlay {
+                    markers,
+                    warnings,
+                    arrows,
+                    altitude_range,
+                    has_missing_altitude,
+                    view_projection,
+                    width,
+                    height,
+                    pixels_per_point,
+                },
+            );
+        });
         for (id, delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, delta);
@@ -541,6 +556,48 @@ fn create_depth_view(
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+fn configure_egui_style(context: &egui::Context) {
+    // The viewer repaints on demand, so a delayed tooltip would never get the
+    // extra frame it needs to appear. Show the metadata as soon as it is hovered.
+    context.all_styles_mut(|style| {
+        style.interaction.tooltip_delay = 0.0;
+        style.interaction.show_tooltips_only_when_still = false;
+    });
+}
+
+fn pointer_position(
+    cursor_position: Option<(f64, f64)>,
+    pixels_per_point: f32,
+) -> Option<egui::Pos2> {
+    let (x, y) = cursor_position?;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some(egui::pos2(
+        (x / pixels_per_point as f64) as f32,
+        (y / pixels_per_point as f64) as f32,
+    ))
+}
+
+fn pointer_events(current: Option<egui::Pos2>, previous: Option<egui::Pos2>) -> Vec<egui::Event> {
+    match (current, previous) {
+        (Some(current), Some(previous)) if current == previous => Vec::new(),
+        (Some(current), _) => vec![egui::Event::PointerMoved(current)],
+        (None, Some(_)) => vec![egui::Event::PointerGone],
+        (None, None) => Vec::new(),
+    }
+}
+
+fn egui_raw_input(screen_rect: egui::Rect, events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(screen_rect),
+        time: Some(time),
+        focused: true,
+        events,
+        ..Default::default()
+    }
+}
+
 fn scene_marker(tracks: &ProjectedTracks, marker: AnalyzedMarker) -> SceneMarker {
     let position = tracks.project_point(&marker.point);
     let route_direction = tracks
@@ -551,9 +608,7 @@ fn scene_marker(tracks: &ProjectedTracks, marker: AnalyzedMarker) -> SceneMarker
     SceneMarker {
         position,
         route_direction,
-        altitude: (marker.point.has_altitude && marker.point.alt.is_finite())
-            .then_some(marker.point.alt),
-        altitude_reference: marker.point.altitude_reference,
+        altitude: marker.point.usable_altitude(),
         kind: marker.kind,
         source: marker.source,
         name: marker.name,
@@ -565,8 +620,7 @@ fn paint_scene_markers(context: &egui::Context, overlay: SceneOverlay<'_>) {
     let SceneOverlay {
         markers,
         warnings,
-        track_segments,
-        track_distances,
+        arrows,
         altitude_range,
         has_missing_altitude,
         view_projection,
@@ -580,23 +634,21 @@ fn paint_scene_markers(context: &egui::Context, overlay: SceneOverlay<'_>) {
     ));
     let logical_width = width as f32 / pixels_per_point;
     let logical_height = height as f32 / pixels_per_point;
-    let mut arrows = Vec::new();
-    for (segment, distances) in track_segments.iter().zip(track_distances) {
-        for (position, direction) in
-            direction_arrows_for_route(segment, distances, DIRECTION_ARROW_SPACING_METERS)
-        {
-            if let Some(arrow) = project_direction_arrow(
-                position,
-                direction,
-                view_projection,
-                logical_width,
-                logical_height,
-            ) {
-                arrows.push(arrow);
-            }
+    let mut projected_arrows = Vec::with_capacity(arrows.len());
+    for &(position, direction) in arrows {
+        if let Some(arrow) = project_direction_arrow(
+            position,
+            direction,
+            view_projection,
+            logical_width,
+            logical_height,
+        ) {
+            projected_arrows.push(arrow);
         }
     }
-    for (tip, direction) in hide_overlapping_arrows(arrows, MIN_DIRECTION_ARROW_SPACING_POINTS) {
+    for (tip, direction) in
+        hide_overlapping_arrows(projected_arrows, MIN_DIRECTION_ARROW_SPACING_POINTS)
+    {
         paint_direction_arrow(&painter, tip, direction);
     }
     for (index, marker) in markers.iter().enumerate() {
@@ -635,11 +687,7 @@ fn paint_scene_markers(context: &egui::Context, overlay: SceneOverlay<'_>) {
         let color = marker_color(marker.kind);
         paint_marker_shape(&painter, center, marker.kind, color, route_direction);
 
-        if let Some(label) = marker_text(
-            marker_label(&marker.name),
-            marker.altitude,
-            marker.altitude_reference,
-        ) {
+        if let Some(label) = marker_text(marker_label(&marker.name), marker.altitude) {
             painter.text(
                 center + egui::vec2(9.0, -14.0 - (index % 3) as f32 * 12.0),
                 egui::Align2::LEFT_CENTER,
@@ -665,7 +713,6 @@ fn paint_scene_markers(context: &egui::Context, overlay: SceneOverlay<'_>) {
                 let label = marker_text(
                     Some(marker_label(&marker.name).unwrap_or(marker.kind.label())),
                     marker.altitude,
-                    marker.altitude_reference,
                 )
                 .unwrap_or_else(|| marker.kind.label().to_owned());
                 let response = ui.colored_label(marker_color(marker.kind), label);
@@ -703,6 +750,8 @@ fn paint_scene_markers(context: &egui::Context, overlay: SceneOverlay<'_>) {
             }
             ui.separator();
             paint_elevation_legend(ui, altitude_range, has_missing_altitude);
+            ui.separator();
+            ui.small("左键拖动旋转 · 滚轮缩放 · Ctrl+O 打开文件");
         });
 }
 
@@ -733,21 +782,12 @@ fn elevation_color(altitude: Option<f64>, range: Option<(f64, f64)>) -> [f32; 3]
     std::array::from_fn(|index| start[index] + (end[index] - start[index]) * local_amount)
 }
 
-fn marker_text(
-    name: Option<&str>,
-    altitude: Option<f64>,
-    altitude_reference: AltitudeReference,
-) -> Option<String> {
+fn marker_text(name: Option<&str>, altitude: Option<f64>) -> Option<String> {
     let name = name.map(str::trim).filter(|name| !name.is_empty());
-    let altitude = altitude.filter(|value| value.is_finite());
-    let altitude_label = match (altitude, altitude_reference) {
-        (Some(altitude), AltitudeReference::Absolute | AltitudeReference::RelativeToGround) => {
-            Some(format!("{altitude:.0}"))
-        }
-        (Some(altitude), AltitudeReference::Unknown) => Some(format!("{altitude:.0}")),
-        _ => None,
-    };
-    match (name, altitude_label) {
+    let altitude = altitude
+        .filter(|value| value.is_finite())
+        .map(|altitude| format!("{altitude:.0}"));
+    match (name, altitude) {
         (Some(name), Some(altitude)) => Some(format!("{name} · {altitude}")),
         (Some(name), None) => Some(name.to_owned()),
         (None, altitude) => altitude,
@@ -888,14 +928,30 @@ fn hide_overlapping_arrows(
     if !minimum_spacing.is_finite() || minimum_spacing <= 0.0 {
         return arrows;
     }
-    let mut visible = Vec::new();
+    // Bucket visible arrows into a screen-space grid whose cells are as wide as
+    // the minimum spacing. Any arrow that could overlap sits in the same cell
+    // or one of its eight neighbours, so this keeps the check near O(n) instead
+    // of comparing every arrow with every previously accepted one.
+    let mut occupied: HashMap<(i32, i32), Vec<egui::Pos2>> = HashMap::new();
+    let mut visible = Vec::with_capacity(arrows.len());
     for arrow in arrows {
-        if visible
-            .iter()
-            .all(|(position, _): &(egui::Pos2, egui::Vec2)| {
-                position.distance(arrow.0) >= minimum_spacing
+        let cell = (
+            (arrow.0.x / minimum_spacing).floor() as i32,
+            (arrow.0.y / minimum_spacing).floor() as i32,
+        );
+        let overlaps = (-1..=1).any(|dx| {
+            (-1..=1).any(|dy| {
+                occupied
+                    .get(&(cell.0 + dx, cell.1 + dy))
+                    .is_some_and(|positions| {
+                        positions
+                            .iter()
+                            .any(|position| position.distance(arrow.0) < minimum_spacing)
+                    })
             })
-        {
+        });
+        if !overlaps {
+            occupied.entry(cell).or_default().push(arrow.0);
             visible.push(arrow);
         }
     }
@@ -1074,6 +1130,80 @@ mod tests {
     }
 
     #[test]
+    fn pointer_positions_are_converted_to_logical_points() {
+        assert_eq!(
+            pointer_position(Some((200.0, 100.0)), 2.0),
+            Some(egui::pos2(100.0, 50.0))
+        );
+        assert_eq!(pointer_position(Some((f64::NAN, 100.0)), 1.0), None);
+        assert_eq!(pointer_position(None, 1.0), None);
+    }
+
+    #[test]
+    fn pointer_events_only_report_changes() {
+        let position = egui::pos2(10.0, 20.0);
+
+        assert_eq!(
+            pointer_events(Some(position), None),
+            vec![egui::Event::PointerMoved(position)]
+        );
+        assert!(
+            pointer_events(Some(position), Some(position)).is_empty(),
+            "a stationary pointer must not look like movement to egui"
+        );
+        assert_eq!(
+            pointer_events(None, Some(position)),
+            vec![egui::Event::PointerGone]
+        );
+        assert!(pointer_events(None, None).is_empty());
+    }
+
+    #[test]
+    fn egui_style_shows_tooltips_without_waiting_for_repaints() {
+        let context = egui::Context::default();
+        configure_egui_style(&context);
+        let style = context.style();
+
+        assert_eq!(style.interaction.tooltip_delay, 0.0);
+        assert!(!style.interaction.show_tooltips_only_when_still);
+    }
+
+    #[test]
+    fn pointer_input_makes_egui_labels_hoverable_across_frames() {
+        let context = egui::Context::default();
+        configure_egui_style(&context);
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 200.0));
+        let pointer = pointer_position(Some((10.0, 10.0)), 1.0);
+        let mut hovered = false;
+        let mut tooltip_open = false;
+        for frame in 0..3 {
+            let events = if frame == 0 {
+                pointer_events(pointer, None)
+            } else {
+                pointer_events(pointer, pointer)
+            };
+            let _ = context.run(
+                egui_raw_input(screen_rect, events, frame as f64 * 0.1),
+                |context| {
+                    egui::Area::new(egui::Id::new("hover-test"))
+                        .fixed_pos(egui::Pos2::ZERO)
+                        .show(context, |ui| {
+                            let response = ui.label("marker");
+                            hovered |= response.hovered();
+                            tooltip_open = response.on_hover_text("ID: test").is_tooltip_open();
+                        });
+                },
+            );
+        }
+
+        assert!(hovered, "the pointer must reach the label across frames");
+        assert!(
+            tooltip_open,
+            "hovering a marker entry must open its metadata tooltip"
+        );
+    }
+
+    #[test]
     fn start_triangle_follows_route_direction_and_defaults_to_screen_up() {
         let center = egui::pos2(20.0, 30.0);
         let north_facing = start_triangle_vertices(center, None);
@@ -1123,11 +1253,7 @@ mod tests {
     #[test]
     fn non_finite_marker_elevation_does_not_generate_a_label() {
         assert_eq!(
-            marker_text(
-                Some(" Summit "),
-                Some(f64::NAN),
-                AltitudeReference::Absolute
-            ),
+            marker_text(Some(" Summit "), Some(f64::NAN)),
             Some("Summit".to_owned())
         );
         assert_eq!(
@@ -1139,29 +1265,16 @@ mod tests {
     #[test]
     fn marker_elevation_is_shown_without_inventing_a_name() {
         assert_eq!(
-            marker_text(Some(" Summit "), Some(123.4), AltitudeReference::Absolute),
+            marker_text(Some(" Summit "), Some(123.4)),
             Some("Summit · 123".to_owned())
         );
+        assert_eq!(marker_text(None, Some(-4.0)), Some("-4".to_owned()));
         assert_eq!(
-            marker_text(None, Some(-4.0), AltitudeReference::Absolute),
-            Some("-4".to_owned())
-        );
-        assert_eq!(
-            marker_text(
-                Some(" Camp "),
-                Some(4.4),
-                AltitudeReference::RelativeToGround
-            ),
+            marker_text(Some(" Camp "), Some(4.4)),
             Some("Camp · 4".to_owned())
         );
-        assert_eq!(
-            marker_text(Some(" Summit "), Some(123.4), AltitudeReference::Unknown),
-            Some("Summit · 123".to_owned())
-        );
-        assert_eq!(
-            marker_text(None, Some(123.4), AltitudeReference::Unknown),
-            Some("123".to_owned())
-        );
+        assert_eq!(marker_text(None, Some(123.4)), Some("123".to_owned()));
+        assert_eq!(marker_text(None, None), None);
     }
 
     #[test]
